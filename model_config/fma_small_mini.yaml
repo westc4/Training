@@ -1,0 +1,9 @@
+# @package __global__
+
+datasource:
+  max_sample_rate: 32000
+  max_channels: 1
+  train: /workspace/data/fma_small_mini/egs/train
+  valid: /workspace/data/fma_small_mini/egs/valid
+  evaluate: /workspace/data/fma_small_mini/egs/valid
+  generate: /workspace/data/fma_small_mini/egs/valid
