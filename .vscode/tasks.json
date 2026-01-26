@@ -1,0 +1,16 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "RunPod: Sync SSH Config",
+      "type": "shell",
+      "command": "${env:HOME}/.ssh/runpod-ssh-sync.sh",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    }
+  ]
+}
