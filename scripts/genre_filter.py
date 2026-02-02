@@ -1,283 +1,195 @@
-#!/usr/bin/env python3
-"""
-Comprehensive audio analysis using Essentia.
-Auto-installs dependencies and downloads models as needed.
-"""
+# pip install essentia  (note: on macOS this is often easiest via conda-forge)
+# For genre tagging you ALSO need a pretrained Essentia model file (.pb) + its labels (.json/.yaml).
+# Example model packs are distributed via "essentia-models" (download separately).
 
 import json
-import os
 import subprocess
-import sys
-import urllib.request
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
-# Set environment variables for optimal GPU usage
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # Reduce TensorFlow logging (0=all, 1=filter INFO, 2=filter WARNING, 3=filter ERROR)
-
-# Force TensorFlow to use GPU for all operations
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use GPU 0
-os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
-os.environ['TF_GPU_THREAD_COUNT'] = '2'
-os.environ['TF_USE_CUDNN'] = '1'
-
-# Try to force TensorFlow operations to GPU
-# Soft placement allows fallback to CPU if GPU operation not available
-# We want to allow this for Essentia compatibility
-os.environ['TF_ENABLE_SOFT_PLACEMENT'] = '1'  # Allow CPU fallback for unsupported ops
-
-# Additional TensorFlow GPU configurations
-os.environ['TF_GPU_HOST_MEM_LIMIT_IN_MB'] = '8000'
-
-# For TensorFlow 2.x, try to force XLA compilation which can help GPU utilization
-os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2 --tf_xla_cpu_global_jit'
-
-# Add CUDA library paths to LD_LIBRARY_PATH
-cuda_paths = [
-    '/usr/local/cuda-11.8/targets/x86_64-linux/lib',
-    '/usr/local/cuda-12.4/targets/x86_64-linux/lib',
-    '/usr/local/lib/python3.11/dist-packages/nvidia/cuda_runtime/lib',
-    '/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib',
-    '/usr/local/lib/python3.11/dist-packages/nvidia/cublas/lib',
-    '/usr/local/lib/python3.11/dist-packages/nvidia/cufft/lib',
-    '/usr/local/lib/python3.11/dist-packages/nvidia/cusparse/lib',
-]
-
-# Get existing LD_LIBRARY_PATH
-existing_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
-
-# Add CUDA paths that exist
-valid_cuda_paths = [p for p in cuda_paths if Path(p).exists()]
-if valid_cuda_paths:
-    new_ld_path = ':'.join(valid_cuda_paths)
-    required_cuda_path = cuda_paths[0]  # The main CUDA 11.8 path
-
-    # Check if we need to restart with updated LD_LIBRARY_PATH
-    # Only restart if the required path is not already in LD_LIBRARY_PATH
-    if required_cuda_path not in existing_ld_path and '__LD_LIBRARY_PATH_SET__' not in os.environ:
-        # Set marker to prevent infinite restart loop
-        os.environ['__LD_LIBRARY_PATH_SET__'] = '1'
-
-        # Update LD_LIBRARY_PATH
-        if existing_ld_path:
-            os.environ['LD_LIBRARY_PATH'] = f"{new_ld_path}:{existing_ld_path}"
-        else:
-            os.environ['LD_LIBRARY_PATH'] = new_ld_path
-
-        print(f"Restarting script with updated LD_LIBRARY_PATH for GPU support...")
-        print(f"Added paths: {new_ld_path}\n")
-
-        # Restart the script with the updated environment
-        os.execve(sys.executable, [sys.executable] + sys.argv, os.environ)
-
-    # If already restarted or path is correct, just update the environ
-    if existing_ld_path and required_cuda_path not in existing_ld_path:
-        os.environ['LD_LIBRARY_PATH'] = f"{new_ld_path}:{existing_ld_path}"
-    elif not existing_ld_path:
-        os.environ['LD_LIBRARY_PATH'] = new_ld_path
-
-
-def ensure_dependencies():
-    """Ensure required Python packages are installed."""
-    needs_restart = False
-
-    # Check if essentia has TensorFlow support
-    try:
-        import essentia.standard as es
-        # Try to access a TensorFlow-based algorithm
-        if not hasattr(es, 'TensorflowPredictEffnetDiscogs'):
-            print("Essentia TensorFlow support not found.")
-            print("Reinstalling with TensorFlow support...")
-            # Uninstall regular essentia and install essentia-tensorflow
-            subprocess.check_call([
-                sys.executable, '-m', 'pip', 'uninstall', '-y', 'essentia'
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            subprocess.check_call([
-                sys.executable, '-m', 'pip', 'install', '--quiet', 'essentia-tensorflow'
-            ])
-            print("Essentia with TensorFlow support installed successfully!")
-            needs_restart = True
-    except ImportError:
-        # Essentia not installed
-        print("Installing essentia-tensorflow...")
-        subprocess.check_call([
-            sys.executable, '-m', 'pip', 'install', '--quiet', 'essentia-tensorflow'
-        ])
-        print("Dependencies installed successfully!")
-        needs_restart = True
-
-    # Ensure numpy is installed
-    try:
-        import numpy
-    except ImportError:
-        print("Installing numpy...")
-        subprocess.check_call([
-            sys.executable, '-m', 'pip', 'install', '--quiet', 'numpy'
-        ])
-        print("Numpy installed successfully!")
-        needs_restart = True
-
-    if needs_restart:
-        print("\nRestarting script to load new dependencies...")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-
-
-def configure_gpu():
-    """Configure TensorFlow to use GPU if available."""
-    try:
-        import tensorflow as tf
-
-        # Enable memory growth to prevent TensorFlow from allocating all GPU memory
-        gpus = tf.config.list_physical_devices('GPU')
-
-        if gpus:
-            print(f"\n{'='*80}")
-            print(f"GPU CONFIGURATION")
-            print(f"{'='*80}")
-            print(f"Found {len(gpus)} GPU(s):")
-
-            for i, gpu in enumerate(gpus):
-                print(f"  GPU {i}: {gpu.name}")
-                try:
-                    # Enable memory growth for this GPU
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                    print(f"    ✓ Memory growth enabled")
-                except RuntimeError as e:
-                    print(f"    ✗ Could not set memory growth: {e}")
-
-            # Set visible devices (use all available GPUs)
-            tf.config.set_visible_devices(gpus, 'GPU')
-
-            # Set GPU as default device for all operations
-            # This is critical for Essentia's TensorFlow operations
-            tf.config.set_logical_device_configuration(
-                gpus[0],
-                [tf.config.LogicalDeviceConfiguration(memory_limit=22000)]  # 22GB limit
-            )
-
-            # Log GPU details
-            print(f"\nTensorFlow GPU Configuration:")
-            print(f"  TensorFlow version: {tf.__version__}")
-            print(f"  Built with CUDA: {tf.test.is_built_with_cuda()}")
-            print(f"  GPU device set as default: /GPU:0")
-
-            # Test GPU computation
-            try:
-                with tf.device('/GPU:0'):
-                    test_tensor = tf.random.normal([1000, 1000])
-                    result = tf.matmul(test_tensor, test_tensor)
-                print(f"  ✓ GPU computation test successful")
-                print(f"\n{'='*80}")
-                print(f"✓✓✓ GPU IS CONFIGURED AND READY ✓✓✓")
-                print(f"{'='*80}\n")
-            except Exception as e:
-                print(f"  ✗ GPU test failed: {e}")
-                print(f"{'='*80}\n")
-
-            return True  # GPU available
-
-        else:
-            print(f"\n{'='*80}")
-            print(f"WARNING: No GPU detected - using CPU")
-            print(f"TensorFlow version: {tf.__version__}")
-            print(f"Built with CUDA: {tf.test.is_built_with_cuda()}")
-            print(f"{'='*80}\n")
-            return False  # No GPU
-
-    except ImportError:
-        print("\nTensorFlow not found - GPU configuration skipped")
-        print("Note: Essentia-TensorFlow includes TensorFlow\n")
-        return False
-    except Exception as e:
-        print(f"\nWarning: GPU configuration failed: {e}")
-        print("Continuing with default configuration...\n")
-        return False
-
-
-def get_gpu_memory_usage():
-    """Get current GPU memory usage if available."""
-    try:
-        import tensorflow as tf
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            # This requires nvidia-smi to be available
-            result = subprocess.run(
-                ['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            if result.returncode == 0:
-                lines = result.stdout.strip().split('\n')
-                gpu_info = []
-                for i, line in enumerate(lines):
-                    used, total = line.split(',')
-                    gpu_info.append({
-                        'gpu_id': i,
-                        'used_mb': int(used.strip()),
-                        'total_mb': int(total.strip()),
-                        'percent': (int(used.strip()) / int(total.strip())) * 100
-                    })
-                return gpu_info
-    except Exception:
-        pass
-    return None
-
-
-def download_file(url: str, output_path: Path):
-    """Download a file from URL to output_path."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if output_path.exists():
-        print(f"  ✓ Already exists: {output_path.name}")
-        return
-
-    print(f"  Downloading: {output_path.name}...")
-    try:
-        urllib.request.urlretrieve(url, output_path)
-        print(f"  ✓ Downloaded: {output_path.name}")
-    except Exception as e:
-        print(f"  ✗ Failed to download {output_path.name}: {e}")
-        raise
-
-
-def ensure_models(models_dir: Path):
-    """Download required Essentia models if they don't exist."""
-    models_dir.mkdir(parents=True, exist_ok=True)
-
-    # Model URLs
-    embedding_base_url = "https://essentia.upf.edu/models/feature-extractors/discogs-effnet/"
-    genre_base_url = "https://essentia.upf.edu/models/classification-heads/mtg_jamendo_genre/"
-    mood_base_url = "https://essentia.upf.edu/models/classification-heads/mtg_jamendo_moodtheme/"
-    instrument_base_url = "https://essentia.upf.edu/models/classification-heads/mtg_jamendo_instrument/"
-
-    models_to_download = [
-        (f"{embedding_base_url}discogs-effnet-bs64-1.pb", models_dir / "discogs-effnet-bs64-1.pb"),
-        (f"{genre_base_url}mtg_jamendo_genre-discogs-effnet-1.pb", models_dir / "mtg_jamendo_genre-discogs-effnet-1.pb"),
-        (f"{genre_base_url}mtg_jamendo_genre-discogs-effnet-1.json", models_dir / "mtg_jamendo_genre-discogs-effnet-1.json"),
-        (f"{mood_base_url}mtg_jamendo_moodtheme-discogs-effnet-1.pb", models_dir / "mtg_jamendo_moodtheme-discogs-effnet-1.pb"),
-        (f"{mood_base_url}mtg_jamendo_moodtheme-discogs-effnet-1.json", models_dir / "mtg_jamendo_moodtheme-discogs-effnet-1.json"),
-        (f"{instrument_base_url}mtg_jamendo_instrument-discogs-effnet-1.pb", models_dir / "mtg_jamendo_instrument-discogs-effnet-1.pb"),
-        (f"{instrument_base_url}mtg_jamendo_instrument-discogs-effnet-1.json", models_dir / "mtg_jamendo_instrument-discogs-effnet-1.json"),
-    ]
-
-    print("Checking/downloading models...")
-    for url, path in models_to_download:
-        download_file(url, path)
-    print("All models ready!\n")
-
-
-# Ensure dependencies are installed first
-ensure_dependencies()
-
-# Configure GPU before importing Essentia (TensorFlow will be configured)
-configure_gpu()
-
-# Now import the packages
 import numpy as np
 import essentia
 import essentia.standard as es
+
+
+# ============================================================================
+# MODEL DOWNLOAD FUNCTIONS
+# ============================================================================
+
+def download_model_file(url: str, destination: Path, description: str = ""):
+    """
+    Download a model file from URL to destination if it doesn't exist.
+    """
+    if destination.exists() and destination.stat().st_size > 0:
+        print(f"  ✓ {destination.name} already exists")
+        return True
+
+    try:
+        print(f"  ⬇ Downloading {description or destination.name}...")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        # Use curl for reliable downloads with progress bar
+        # -L: follow redirects, -f: fail on HTTP errors, -#: progress bar
+        result = subprocess.run(
+            ["curl", "-L", "-f", "-#", "-o", str(destination), url],
+            capture_output=False,
+            timeout=300
+        )
+
+        if result.returncode == 0 and destination.exists() and destination.stat().st_size > 0:
+            print(f"  ✓ Downloaded {destination.name}")
+            return True
+        else:
+            if destination.exists():
+                destination.unlink()  # Remove empty/incomplete file
+            print(f"  ✗ Failed to download {destination.name}")
+            return False
+
+    except subprocess.TimeoutExpired:
+        if destination.exists():
+            destination.unlink()
+        print(f"  ✗ Download timeout for {destination.name}")
+        return False
+    except Exception as e:
+        if destination.exists():
+            destination.unlink()
+        print(f"  ✗ Failed to download {destination.name}: {e}")
+        return False
+
+
+def download_essentia_models(models_dir: str) -> Dict[str, bool]:
+    """
+    Download all required Essentia models if they don't exist.
+
+    Returns:
+        Dictionary indicating which model sets are available
+    """
+    models_path = Path(models_dir)
+    models_path.mkdir(parents=True, exist_ok=True)
+
+    # Base URL for Essentia models
+    base_url = "https://essentia.upf.edu/models"
+
+    print("\n" + "=" * 80)
+    print("CHECKING ESSENTIA MODELS")
+    print("=" * 80)
+
+    # Track which model sets are available
+    available = {
+        "base": False,
+        "discogs519": False,
+        "approachability": False,
+        "engagement": False,
+        "mood_emotions": False,
+        "tonality": False,
+    }
+
+    # ========================================================================
+    # BASE MODELS (MTG Jamendo - Required)
+    # ========================================================================
+    print("\nBase Models (MTG Jamendo):")
+
+    base_models = [
+        ("discogs-effnet-bs64-1.pb", f"{base_url}/feature-extractors/discogs-effnet/discogs-effnet-bs64-1.pb"),
+        ("mtg_jamendo_genre-discogs-effnet-1.pb", f"{base_url}/classification-heads/mtg_jamendo_genre/mtg_jamendo_genre-discogs-effnet-1.pb"),
+        ("mtg_jamendo_genre-discogs-effnet-1.json", f"{base_url}/classification-heads/mtg_jamendo_genre/mtg_jamendo_genre-discogs-effnet-1.json"),
+        ("mtg_jamendo_moodtheme-discogs-effnet-1.pb", f"{base_url}/classification-heads/mtg_jamendo_moodtheme/mtg_jamendo_moodtheme-discogs-effnet-1.pb"),
+        ("mtg_jamendo_moodtheme-discogs-effnet-1.json", f"{base_url}/classification-heads/mtg_jamendo_moodtheme/mtg_jamendo_moodtheme-discogs-effnet-1.json"),
+        ("mtg_jamendo_instrument-discogs-effnet-1.pb", f"{base_url}/classification-heads/mtg_jamendo_instrument/mtg_jamendo_instrument-discogs-effnet-1.pb"),
+        ("mtg_jamendo_instrument-discogs-effnet-1.json", f"{base_url}/classification-heads/mtg_jamendo_instrument/mtg_jamendo_instrument-discogs-effnet-1.json"),
+    ]
+
+    base_success = all(download_model_file(url, models_path / filename, filename)
+                       for filename, url in base_models)
+    available["base"] = base_success
+
+    # ========================================================================
+    # GENRE DISCOGS519 (MAEST-based - Optional)
+    # ========================================================================
+    print("\nGenre Discogs519 Models (519 genres):")
+
+    discogs519_models = [
+        ("discogs-maest-30s-pw-519l-2.pb", f"{base_url}/feature-extractors/maest/discogs-maest-30s-pw-519l-2.pb"),
+        ("genre_discogs519-discogs-maest-30s-pw-519l-1.pb", f"{base_url}/classification-heads/genre_discogs519/genre_discogs519-discogs-maest-30s-pw-519l-1.pb"),
+        ("genre_discogs519-discogs-maest-30s-pw-519l-1.json", f"{base_url}/classification-heads/genre_discogs519/genre_discogs519-discogs-maest-30s-pw-519l-1.json"),
+    ]
+
+    discogs519_success = all(download_model_file(url, models_path / filename, filename)
+                            for filename, url in discogs519_models)
+    available["discogs519"] = discogs519_success
+
+    # ========================================================================
+    # APPROACHABILITY (Optional)
+    # ========================================================================
+    print("\nApproachability Model:")
+
+    approachability_models = [
+        ("approachability_regression-discogs-effnet-1.pb",
+         f"{base_url}/classification-heads/approachability/approachability_regression-discogs-effnet-1.pb"),
+    ]
+
+    approachability_success = all(download_model_file(url, models_path / filename, filename)
+                                  for filename, url in approachability_models)
+    available["approachability"] = approachability_success
+
+    # ========================================================================
+    # ENGAGEMENT (Optional)
+    # ========================================================================
+    print("\nEngagement Model:")
+
+    engagement_models = [
+        ("engagement_regression-discogs-effnet-1.pb",
+         f"{base_url}/classification-heads/engagement/engagement_regression-discogs-effnet-1.pb"),
+    ]
+
+    engagement_success = all(download_model_file(url, models_path / filename, filename)
+                            for filename, url in engagement_models)
+    available["engagement"] = engagement_success
+
+    # ========================================================================
+    # MOOD EMOTIONS (Optional)
+    # ========================================================================
+    print("\nMood Emotion Models (aggressive, happy, party, relaxed, sad):")
+
+    mood_emotions_models = [
+        ("mood_aggressive-discogs-effnet-1.pb", f"{base_url}/classification-heads/mood_aggressive/mood_aggressive-discogs-effnet-1.pb"),
+        ("mood_happy-discogs-effnet-1.pb", f"{base_url}/classification-heads/mood_happy/mood_happy-discogs-effnet-1.pb"),
+        ("mood_party-discogs-effnet-1.pb", f"{base_url}/classification-heads/mood_party/mood_party-discogs-effnet-1.pb"),
+        ("mood_relaxed-discogs-effnet-1.pb", f"{base_url}/classification-heads/mood_relaxed/mood_relaxed-discogs-effnet-1.pb"),
+        ("mood_sad-discogs-effnet-1.pb", f"{base_url}/classification-heads/mood_sad/mood_sad-discogs-effnet-1.pb"),
+    ]
+
+    mood_emotions_success = all(download_model_file(url, models_path / filename, filename)
+                               for filename, url in mood_emotions_models)
+    available["mood_emotions"] = mood_emotions_success
+
+    # ========================================================================
+    # TONALITY (Optional)
+    # ========================================================================
+    print("\nTonality Model:")
+
+    tonality_models = [
+        ("tonal_atonal-discogs-effnet-1.pb", f"{base_url}/classification-heads/tonal_atonal/tonal_atonal-discogs-effnet-1.pb"),
+    ]
+
+    tonality_success = all(download_model_file(url, models_path / filename, filename)
+                          for filename, url in tonality_models)
+    available["tonality"] = tonality_success
+
+    # ========================================================================
+    # SUMMARY
+    # ========================================================================
+    print("\n" + "-" * 80)
+    print("Model Availability Summary:")
+    print(f"  Base Models:         {'✓ Available' if available['base'] else '✗ Missing'}")
+    print(f"  Genre Discogs519:    {'✓ Available' if available['discogs519'] else '✗ Missing'}")
+    print(f"  Approachability:     {'✓ Available' if available['approachability'] else '✗ Missing'}")
+    print(f"  Engagement:          {'✓ Available' if available['engagement'] else '✗ Missing'}")
+    print(f"  Mood Emotions:       {'✓ Available' if available['mood_emotions'] else '✗ Missing'}")
+    print(f"  Tonality:            {'✓ Available' if available['tonality'] else '✗ Missing'}")
+    print("=" * 80 + "\n")
+
+    return available
 
 
 def detect_bpm_essentia(path: str, sr: int = 44100):
@@ -472,6 +384,208 @@ def detect_instruments_essentia(
     # Top-k
     idx = np.argsort(-predictions_avg)[:topk]
     return [(str(labels[i]), float(predictions_avg[i])) for i in idx]
+
+
+def detect_genre_discogs519(
+    path: str,
+    maest_model_pb: str,
+    classifier_model_pb: str,
+    labels_json: str,
+    topk: int = 10,
+):
+    """
+    Genre inference using Essentia's MAEST embeddings + Discogs 519-genre classifier.
+
+    Args:
+        path: Audio file path
+        maest_model_pb: Path to MAEST embedding model (discogs-maest-30s-pw-519l-2.pb)
+        classifier_model_pb: Path to genre classifier (genre_discogs519-discogs-maest-30s-pw-519l-1.pb)
+        labels_json: Path to labels file
+        topk: Number of top genres to return
+
+    Returns:
+        List of (genre, score) tuples sorted by score descending
+    """
+    # Load mono audio at 16kHz (required for MAEST)
+    audio = es.MonoLoader(filename=path, sampleRate=16000)()
+
+    # Extract MAEST embeddings
+    maest_model = es.TensorflowPredictMAEST(
+        graphFilename=str(Path(maest_model_pb).expanduser()),
+        output="PartitionedCall/Identity_12"
+    )
+    embeddings = maest_model(audio)
+
+    # Run genre classification
+    classifier = es.TensorflowPredict2D(
+        graphFilename=str(Path(classifier_model_pb).expanduser()),
+        input="serving_default_model_Placeholder",
+        output="PartitionedCall"
+    )
+    predictions = classifier(embeddings)
+
+    # Load labels
+    with open(labels_json, "r") as f:
+        labels_obj = json.load(f)
+
+    if isinstance(labels_obj, dict) and "classes" in labels_obj:
+        labels = labels_obj["classes"]
+    elif isinstance(labels_obj, list):
+        labels = labels_obj
+    else:
+        raise RuntimeError("labels_json must have 'classes' key or be a list")
+
+    # Average predictions across time
+    predictions_avg = np.mean(predictions, axis=0)
+
+    if len(labels) != len(predictions_avg):
+        raise RuntimeError(f"Label count ({len(labels)}) != output size ({len(predictions_avg)})")
+
+    # Top-k
+    idx = np.argsort(-predictions_avg)[:topk]
+    return [(str(labels[i]), float(predictions_avg[i])) for i in idx]
+
+
+def detect_approachability_engagement(
+    path: str,
+    embedding_model_pb: str,
+    approachability_model_pb: str,
+    engagement_model_pb: str,
+):
+    """
+    Detect approachability and engagement using regression models.
+
+    Approachability: whether music is accessible to general public vs niche/experimental
+    Engagement: active "lean forward" listening vs passive "lean back" background listening
+
+    Returns:
+        Dictionary with approachability and engagement scores (0-1)
+    """
+    # Load mono audio at 16kHz
+    audio = es.MonoLoader(filename=path, sampleRate=16000)()
+
+    # Extract embeddings using TensorflowPredictEffnetDiscogs
+    embedding_model = es.TensorflowPredictEffnetDiscogs(
+        graphFilename=str(Path(embedding_model_pb).expanduser()),
+        output="PartitionedCall:1"
+    )
+    embeddings = embedding_model(audio)
+
+    # Approachability prediction
+    approachability_classifier = es.TensorflowPredict2D(
+        graphFilename=str(Path(approachability_model_pb).expanduser()),
+        input="model/Placeholder",
+        output="model/Identity"
+    )
+    approachability_predictions = approachability_classifier(embeddings)
+    approachability_score = float(np.mean(approachability_predictions))
+
+    # Engagement prediction
+    engagement_classifier = es.TensorflowPredict2D(
+        graphFilename=str(Path(engagement_model_pb).expanduser()),
+        input="model/Placeholder",
+        output="model/Identity"
+    )
+    engagement_predictions = engagement_classifier(embeddings)
+    engagement_score = float(np.mean(engagement_predictions))
+
+    return {
+        "approachability": approachability_score,
+        "engagement": engagement_score,
+    }
+
+
+def detect_mood_emotions(
+    path: str,
+    embedding_model_pb: str,
+    aggressive_model_pb: str,
+    happy_model_pb: str,
+    party_model_pb: str,
+    relaxed_model_pb: str,
+    sad_model_pb: str,
+):
+    """
+    Detect specific mood emotions: aggressive, happy, party, relaxed, sad.
+    Each is a binary classification (present/absent).
+
+    Returns:
+        Dictionary with mood scores (0-1) for each emotion
+    """
+    # Load mono audio at 16kHz
+    audio = es.MonoLoader(filename=path, sampleRate=16000)()
+
+    # Extract embeddings
+    embedding_model = es.TensorflowPredictEffnetDiscogs(
+        graphFilename=str(Path(embedding_model_pb).expanduser()),
+        output="PartitionedCall:1"
+    )
+    embeddings = embedding_model(audio)
+
+    moods = {}
+    mood_models = {
+        "aggressive": aggressive_model_pb,
+        "happy": happy_model_pb,
+        "party": party_model_pb,
+        "relaxed": relaxed_model_pb,
+        "sad": sad_model_pb,
+    }
+
+    for mood_name, model_path in mood_models.items():
+        classifier = es.TensorflowPredict2D(
+            graphFilename=str(Path(model_path).expanduser()),
+            input="model/Placeholder",
+            output="model/Softmax"
+        )
+        predictions = classifier(embeddings)
+
+        # Average predictions across time, take probability of "present" class
+        predictions_avg = np.mean(predictions, axis=0)
+        # Assuming index 1 is "present", index 0 is "absent"
+        mood_score = float(predictions_avg[1]) if len(predictions_avg) > 1 else float(predictions_avg[0])
+        moods[mood_name] = mood_score
+
+    return moods
+
+
+def detect_tonal_atonal(
+    path: str,
+    embedding_model_pb: str,
+    classifier_model_pb: str,
+):
+    """
+    Detect whether music is tonal or atonal.
+
+    Returns:
+        Dictionary with tonal probability and classification
+    """
+    # Load mono audio at 16kHz
+    audio = es.MonoLoader(filename=path, sampleRate=16000)()
+
+    # Extract embeddings
+    embedding_model = es.TensorflowPredictEffnetDiscogs(
+        graphFilename=str(Path(embedding_model_pb).expanduser()),
+        output="PartitionedCall:1"
+    )
+    embeddings = embedding_model(audio)
+
+    # Tonality prediction
+    classifier = es.TensorflowPredict2D(
+        graphFilename=str(Path(classifier_model_pb).expanduser()),
+        input="model/Placeholder",
+        output="model/Softmax"
+    )
+    predictions = classifier(embeddings)
+
+    # Average predictions across time
+    predictions_avg = np.mean(predictions, axis=0)
+
+    # Assuming index 0 is "atonal", index 1 is "tonal"
+    tonal_score = float(predictions_avg[1]) if len(predictions_avg) > 1 else float(predictions_avg[0])
+
+    return {
+        "tonal_score": tonal_score,
+        "is_tonal": tonal_score > 0.5,
+    }
 
 
 def detect_musical_structure(path: str, sr: int = 44100) -> Dict:
@@ -686,9 +800,27 @@ def comprehensive_audio_analysis(
     mood_labels_json: str,
     instrument_model_pb: str,
     instrument_labels_json: str,
+    # New models
+    maest_model_pb: Optional[str] = None,
+    genre_discogs519_model_pb: Optional[str] = None,
+    genre_discogs519_labels_json: Optional[str] = None,
+    approachability_model_pb: Optional[str] = None,
+    engagement_model_pb: Optional[str] = None,
+    aggressive_model_pb: Optional[str] = None,
+    happy_model_pb: Optional[str] = None,
+    party_model_pb: Optional[str] = None,
+    relaxed_model_pb: Optional[str] = None,
+    sad_model_pb: Optional[str] = None,
+    tonal_atonal_model_pb: Optional[str] = None,
 ) -> Dict:
     """
     Comprehensive audio analysis returning all requested features.
+
+    New optional parameters allow for extended analysis:
+    - Genre Discogs519: 519 genre classification using MAEST embeddings
+    - Approachability/Engagement: accessibility and listening style metrics
+    - Mood emotions: specific binary classifications for aggressive, happy, party, relaxed, sad
+    - Tonality: tonal vs atonal classification
     """
     # BPM Detection (with fixed confidence normalization)
     bpm, bpm_conf_raw, bpm_conf_norm, bpm_is_reliable = detect_bpm_essentia(path)
@@ -716,6 +848,51 @@ def comprehensive_audio_analysis(
     instrument_results = detect_instruments_essentia(
         path, embedding_model_pb, instrument_model_pb, instrument_labels_json, topk=10
     )
+
+    # === NEW MODELS ===
+
+    # Genre Discogs519 (if models provided)
+    genre_discogs519_results = None
+    if all([maest_model_pb, genre_discogs519_model_pb, genre_discogs519_labels_json]):
+        try:
+            genre_discogs519_results = detect_genre_discogs519(
+                path, maest_model_pb, genre_discogs519_model_pb,
+                genre_discogs519_labels_json, topk=10
+            )
+        except Exception as e:
+            print(f"Warning: Genre Discogs519 detection failed: {e}")
+
+    # Approachability & Engagement (if models provided)
+    approachability_engagement = None
+    if all([approachability_model_pb, engagement_model_pb]):
+        try:
+            approachability_engagement = detect_approachability_engagement(
+                path, embedding_model_pb, approachability_model_pb, engagement_model_pb
+            )
+        except Exception as e:
+            print(f"Warning: Approachability/Engagement detection failed: {e}")
+
+    # Mood Emotions (if models provided)
+    mood_emotions = None
+    if all([aggressive_model_pb, happy_model_pb, party_model_pb, relaxed_model_pb, sad_model_pb]):
+        try:
+            mood_emotions = detect_mood_emotions(
+                path, embedding_model_pb,
+                aggressive_model_pb, happy_model_pb, party_model_pb,
+                relaxed_model_pb, sad_model_pb
+            )
+        except Exception as e:
+            print(f"Warning: Mood emotions detection failed: {e}")
+
+    # Tonality (if model provided)
+    tonality = None
+    if tonal_atonal_model_pb:
+        try:
+            tonality = detect_tonal_atonal(
+                path, embedding_model_pb, tonal_atonal_model_pb
+            )
+        except Exception as e:
+            print(f"Warning: Tonality detection failed: {e}")
 
     # Derive energy level from mood tags
     energy_indicators = {
@@ -1124,7 +1301,7 @@ def comprehensive_audio_analysis(
     best_club_scene = sorted_scenes[0][0]
     best_club_scene_score = sorted_scenes[0][1]
 
-    return {
+    result = {
         # BPM (fixed confidence normalization)
         "bpm": bpm,
         "bpm_conf_raw": bpm_conf_raw,
@@ -1195,33 +1372,72 @@ def comprehensive_audio_analysis(
         "source_format": tech_metadata["source_format"],
     }
 
+    # Add new model results if available
+    if genre_discogs519_results is not None:
+        result["genre_discogs519_top1"] = genre_discogs519_results[0][0] if genre_discogs519_results else "unknown"
+        result["genre_discogs519_topk"] = genre_discogs519_results
+
+    if approachability_engagement is not None:
+        result["approachability"] = approachability_engagement["approachability"]
+        result["engagement"] = approachability_engagement["engagement"]
+
+    if mood_emotions is not None:
+        result["mood_aggressive"] = mood_emotions["aggressive"]
+        result["mood_happy"] = mood_emotions["happy"]
+        result["mood_party"] = mood_emotions["party"]
+        result["mood_relaxed"] = mood_emotions["relaxed"]
+        result["mood_sad"] = mood_emotions["sad"]
+
+    if tonality is not None:
+        result["tonal_score"] = tonality["tonal_score"]
+        result["is_tonal"] = tonality["is_tonal"]
+
+    return result
+
 
 # ---- Example usage ----
 if __name__ == "__main__":
-    # Setup paths
-    workspace_root = Path("/root/workspace")
-    audio_dir = workspace_root / "data" / "jamendo" / "downloads"
-    models_dir = workspace_root / "data" / "models"
+    #test = "/Users/cliftonwest/Documents/Image-Line/FL Studio/Projects/Project_113/Project_113.mp3"
+    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/21_Savage_-_Bank_Account_Official_Audio.webm"
+    test = "/root/workspace/data/jamendo/downloads/168_TriFace_Jme FPM.mp3"
+    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Daft_Punk_-_Veridis_Quo.webm"
+    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Drake_-_Hotline_Bling.webm"
+    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Eddie_Murphy_-_Party_All_the_Time_Official_Video.webm"
+    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Jack_Harlow_-_Lovin_On_Me_Official_Music_Video.webm"
 
-    # Ensure models are downloaded
-    ensure_models(models_dir)
+    # Model directory
+    models_dir = "/root/workspace/data/models/essentia"
 
-    # Find sample audio files
-    audio_files = sorted(audio_dir.glob("*.mp3"))[:3]  # Use first 3 MP3 files
-    if not audio_files:
-        print(f"No audio files found in {audio_dir}")
-        sys.exit(1)
+    # Download models if they don't exist
+    available = download_essentia_models(models_dir)
 
-    test = str(audio_files[0])  # Use first file as test
+    # Check if base models are available
+    if not available["base"]:
+        print("ERROR: Base models are required but failed to download.")
+        print("Please check your internet connection and try again.")
+        exit(1)
 
     # Model paths
-    embedding_model = str(models_dir / "discogs-effnet-bs64-1.pb")
-    genre_model = str(models_dir / "mtg_jamendo_genre-discogs-effnet-1.pb")
-    genre_labels = str(models_dir / "mtg_jamendo_genre-discogs-effnet-1.json")
-    mood_model = str(models_dir / "mtg_jamendo_moodtheme-discogs-effnet-1.pb")
-    mood_labels = str(models_dir / "mtg_jamendo_moodtheme-discogs-effnet-1.json")
-    instrument_model = str(models_dir / "mtg_jamendo_instrument-discogs-effnet-1.pb")
-    instrument_labels = str(models_dir / "mtg_jamendo_instrument-discogs-effnet-1.json")
+    embedding_model = f"{models_dir}/discogs-effnet-bs64-1.pb"
+    genre_model = f"{models_dir}/mtg_jamendo_genre-discogs-effnet-1.pb"
+    genre_labels = f"{models_dir}/mtg_jamendo_genre-discogs-effnet-1.json"
+    mood_model = f"{models_dir}/mtg_jamendo_moodtheme-discogs-effnet-1.pb"
+    mood_labels = f"{models_dir}/mtg_jamendo_moodtheme-discogs-effnet-1.json"
+    instrument_model = f"{models_dir}/mtg_jamendo_instrument-discogs-effnet-1.pb"
+    instrument_labels = f"{models_dir}/mtg_jamendo_instrument-discogs-effnet-1.json"
+
+    # Optional model paths (only use if available)
+    maest_model = f"{models_dir}/discogs-maest-30s-pw-519l-2.pb" if available["discogs519"] else None
+    genre_discogs519_model = f"{models_dir}/genre_discogs519-discogs-maest-30s-pw-519l-1.pb" if available["discogs519"] else None
+    genre_discogs519_labels = f"{models_dir}/genre_discogs519-discogs-maest-30s-pw-519l-1.json" if available["discogs519"] else None
+    approachability_model = f"{models_dir}/approachability_regression-discogs-effnet-1.pb" if available["approachability"] else None
+    engagement_model = f"{models_dir}/engagement_regression-discogs-effnet-1.pb" if available["engagement"] else None
+    aggressive_model = f"{models_dir}/mood_aggressive-discogs-effnet-1.pb" if available["mood_emotions"] else None
+    happy_model = f"{models_dir}/mood_happy-discogs-effnet-1.pb" if available["mood_emotions"] else None
+    party_model = f"{models_dir}/mood_party-discogs-effnet-1.pb" if available["mood_emotions"] else None
+    relaxed_model = f"{models_dir}/mood_relaxed-discogs-effnet-1.pb" if available["mood_emotions"] else None
+    sad_model = f"{models_dir}/mood_sad-discogs-effnet-1.pb" if available["mood_emotions"] else None
+    tonal_atonal_model = f"{models_dir}/tonal_atonal-discogs-effnet-1.pb" if available["tonality"] else None
 
     print("=" * 80)
     print("COMPREHENSIVE AUDIO ANALYSIS")
@@ -1229,18 +1445,7 @@ if __name__ == "__main__":
     print(f"File: {test}")
     print()
 
-    # Show GPU memory before analysis
-    gpu_mem_before = get_gpu_memory_usage()
-    if gpu_mem_before:
-        print(f"GPU Memory (before analysis):")
-        for gpu in gpu_mem_before:
-            print(f"  GPU {gpu['gpu_id']}: {gpu['used_mb']} MB / {gpu['total_mb']} MB ({gpu['percent']:.1f}%)")
-        print()
-
     # Run comprehensive analysis
-    print("Running comprehensive audio analysis...")
-    print("(This may take a minute... GPU will be used for TensorFlow inference)\n")
-
     results = comprehensive_audio_analysis(
         path=test,
         embedding_model_pb=embedding_model,
@@ -1250,15 +1455,19 @@ if __name__ == "__main__":
         mood_labels_json=mood_labels,
         instrument_model_pb=instrument_model,
         instrument_labels_json=instrument_labels,
+        # Optional models (will be None if not available)
+        maest_model_pb=maest_model,
+        genre_discogs519_model_pb=genre_discogs519_model,
+        genre_discogs519_labels_json=genre_discogs519_labels,
+        approachability_model_pb=approachability_model,
+        engagement_model_pb=engagement_model,
+        aggressive_model_pb=aggressive_model,
+        happy_model_pb=happy_model,
+        party_model_pb=party_model,
+        relaxed_model_pb=relaxed_model,
+        sad_model_pb=sad_model,
+        tonal_atonal_model_pb=tonal_atonal_model,
     )
-
-    # Show GPU memory after analysis
-    gpu_mem_after = get_gpu_memory_usage()
-    if gpu_mem_after:
-        print("\nGPU Memory (after analysis):")
-        for gpu in gpu_mem_after:
-            print(f"  GPU {gpu['gpu_id']}: {gpu['used_mb']} MB / {gpu['total_mb']} MB ({gpu['percent']:.1f}%)")
-        print()
 
     # Display results
     print("TECHNICAL METADATA")
@@ -1351,5 +1560,39 @@ if __name__ == "__main__":
     print(f"  Is Clipped: {results['is_clipped']}")
     print(f"  Is Too Quiet: {results['is_too_quiet']}")
     print()
+
+    # Display new model results if available
+    if "genre_discogs519_topk" in results:
+        print("GENRE DISCOGS519 (519 genres)")
+        print("-" * 80)
+        print(f"  Primary Genre: {results['genre_discogs519_top1']}")
+        print(f"  Top 10 Genres:")
+        for i, (genre, score) in enumerate(results['genre_discogs519_topk'], 1):
+            print(f"    {i:2d}. {genre:30s} {score:.4f}")
+        print()
+
+    if "approachability" in results:
+        print("APPROACHABILITY & ENGAGEMENT")
+        print("-" * 80)
+        print(f"  Approachability: {results['approachability']:.3f} (0=niche/experimental, 1=accessible)")
+        print(f"  Engagement: {results['engagement']:.3f} (0=lean back/background, 1=lean forward/active)")
+        print()
+
+    if "mood_aggressive" in results:
+        print("MOOD EMOTIONS (binary classifications)")
+        print("-" * 80)
+        print(f"  Aggressive: {results['mood_aggressive']:.3f}")
+        print(f"  Happy:      {results['mood_happy']:.3f}")
+        print(f"  Party:      {results['mood_party']:.3f}")
+        print(f"  Relaxed:    {results['mood_relaxed']:.3f}")
+        print(f"  Sad:        {results['mood_sad']:.3f}")
+        print()
+
+    if "tonal_score" in results:
+        print("TONALITY")
+        print("-" * 80)
+        print(f"  Tonal Score: {results['tonal_score']:.3f}")
+        print(f"  Is Tonal: {results['is_tonal']}")
+        print()
 
     print("=" * 80)
