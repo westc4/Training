@@ -83,13 +83,82 @@ else
   fi
 fi
 
+
+# -----------------------------
+# Install Libraries
+# -----------------------------
+
+WORKDIR="/root/workspace"
+VENV_DIR="${WORKDIR}/.venv"
+
+# Candidate python binaries (first match wins)
+PY_CANDIDATES=(
+  "/usr/bin/python"
+  "/usr/bin/python3.10"
+)
+
+echo "[info] Target workdir: ${WORKDIR}"
+mkdir -p "${WORKDIR}"
+
+# Pick a python that exists and is executable
+PY_BIN=""
+for c in "${PY_CANDIDATES[@]}"; do
+  if [[ -x "$c" ]]; then
+    PY_BIN="$c"
+    break
+  fi
+done
+
+if [[ -z "${PY_BIN}" ]]; then
+  echo "[error] No usable python found. Tried:"
+  printf '  - %s\n' "${PY_CANDIDATES[@]}"
+  exit 1
+fi
+
+echo "[info] Using python: ${PY_BIN}"
+"${PY_BIN}" --version
+
+# Ensure venv module is available
+if ! "${PY_BIN}" -c "import venv" >/dev/null 2>&1; then
+  echo "[error] Selected python cannot import 'venv' module."
+  echo "        On Debian/Ubuntu, you may need: apt-get update && apt-get install -y python3-venv"
+  exit 1
+fi
+
+# Create venv if missing
+if [[ ! -d "${VENV_DIR}" ]]; then
+  echo "[info] Creating venv at: ${VENV_DIR}"
+  "${PY_BIN}" -m venv "${VENV_DIR}"
+else
+  echo "[info] Venv already exists at: ${VENV_DIR}"
+fi
+
+# Activate venv
+# shellcheck disable=SC1090
+source "${VENV_DIR}/bin/activate"
+
+echo "[info] Venv python: $(command -v python)"
+python --version
+
+# Upgrade pip tooling
+echo "[info] Upgrading pip/setuptools/wheel..."
+python -m pip install --upgrade pip setuptools wheel
+
+# Install packages
+echo "[info] Installing packages: httpx pandas pyarrow tqdm tenacity"
+python -m pip install --upgrade httpx pandas pyarrow tqdm tenacity
+
+echo "[done] Installed into venv: ${VENV_DIR}"
+echo "To use it now: source ${VENV_DIR}/bin/activate"
+
+
 # export final variables (RunPod secrets)
 export ACCOUNT_ID="{{ RUNPOD_SECRET_ACCOUNT_ID }}"
 export AWS_ACCESS_KEY_ID="{{ RUNPOD_SECRET_AWS_ACCESS_KEY_ID }}"
 export AWS_SECRET_ACCESS_KEY="{{ RUNPOD_SECRET_AWS_SECRET_ACCESS_KEY }}"
 export AWS_DEFAULT_REGION="auto"
-export GITMAIL="{{ RUNPOD_SECRET_GITMAIL }}"
-export GITUSER="{{ RUNPOD_SECRET_GITUSER }}"
+export GITMAIL="cliftonw101@gmail.com"
+export GITUSER="westc4"
 export HF_TOKEN="{{ RUNPOD_SECRET_HF_TOKEN }}"
 export GH_PAT="{{ RUNPOD_SECRET_GH_PAT }}"
 
