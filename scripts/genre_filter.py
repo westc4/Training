@@ -1,12 +1,280 @@
-# pip install essentia  (note: on macOS this is often easiest via conda-forge)
-# For genre tagging you ALSO need a pretrained Essentia model file (.pb) + its labels (.json/.yaml).
-# Example model packs are distributed via "essentia-models" (download separately).
+#!/usr/bin/env python3
+"""
+Comprehensive audio analysis using Essentia.
+Auto-installs dependencies and downloads models as needed.
+"""
 
 import json
+import os
 import subprocess
+import sys
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
+# Set environment variables for optimal GPU usage
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'  # Reduce TensorFlow logging (0=all, 1=filter INFO, 2=filter WARNING, 3=filter ERROR)
+
+# Force TensorFlow to use GPU for all operations
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Use GPU 0
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_GPU_THREAD_COUNT'] = '2'
+os.environ['TF_USE_CUDNN'] = '1'
+
+# Try to force TensorFlow operations to GPU
+# Soft placement allows fallback to CPU if GPU operation not available
+# We want to allow this for Essentia compatibility
+os.environ['TF_ENABLE_SOFT_PLACEMENT'] = '1'  # Allow CPU fallback for unsupported ops
+
+# Additional TensorFlow GPU configurations
+os.environ['TF_GPU_HOST_MEM_LIMIT_IN_MB'] = '8000'
+
+# For TensorFlow 2.x, try to force XLA compilation which can help GPU utilization
+os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2 --tf_xla_cpu_global_jit'
+
+# Add CUDA library paths to LD_LIBRARY_PATH
+cuda_paths = [
+    '/usr/local/cuda-11.8/targets/x86_64-linux/lib',
+    '/usr/local/cuda-12.4/targets/x86_64-linux/lib',
+    '/usr/local/lib/python3.11/dist-packages/nvidia/cuda_runtime/lib',
+    '/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib',
+    '/usr/local/lib/python3.11/dist-packages/nvidia/cublas/lib',
+    '/usr/local/lib/python3.11/dist-packages/nvidia/cufft/lib',
+    '/usr/local/lib/python3.11/dist-packages/nvidia/cusparse/lib',
+]
+
+# Get existing LD_LIBRARY_PATH
+existing_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+
+# Add CUDA paths that exist
+valid_cuda_paths = [p for p in cuda_paths if Path(p).exists()]
+if valid_cuda_paths:
+    new_ld_path = ':'.join(valid_cuda_paths)
+    required_cuda_path = cuda_paths[0]  # The main CUDA 11.8 path
+
+    # Check if we need to restart with updated LD_LIBRARY_PATH
+    # Only restart if the required path is not already in LD_LIBRARY_PATH
+    if required_cuda_path not in existing_ld_path and '__LD_LIBRARY_PATH_SET__' not in os.environ:
+        # Set marker to prevent infinite restart loop
+        os.environ['__LD_LIBRARY_PATH_SET__'] = '1'
+
+        # Update LD_LIBRARY_PATH
+        if existing_ld_path:
+            os.environ['LD_LIBRARY_PATH'] = f"{new_ld_path}:{existing_ld_path}"
+        else:
+            os.environ['LD_LIBRARY_PATH'] = new_ld_path
+
+        print(f"Restarting script with updated LD_LIBRARY_PATH for GPU support...")
+        print(f"Added paths: {new_ld_path}\n")
+
+        # Restart the script with the updated environment
+        os.execve(sys.executable, [sys.executable] + sys.argv, os.environ)
+
+    # If already restarted or path is correct, just update the environ
+    if existing_ld_path and required_cuda_path not in existing_ld_path:
+        os.environ['LD_LIBRARY_PATH'] = f"{new_ld_path}:{existing_ld_path}"
+    elif not existing_ld_path:
+        os.environ['LD_LIBRARY_PATH'] = new_ld_path
+
+
+def ensure_dependencies():
+    """Ensure required Python packages are installed."""
+    needs_restart = False
+
+    # Check if essentia has TensorFlow support
+    try:
+        import essentia.standard as es
+        # Try to access a TensorFlow-based algorithm
+        if not hasattr(es, 'TensorflowPredictEffnetDiscogs'):
+            print("Essentia TensorFlow support not found.")
+            print("Reinstalling with TensorFlow support...")
+            # Uninstall regular essentia and install essentia-tensorflow
+            subprocess.check_call([
+                sys.executable, '-m', 'pip', 'uninstall', '-y', 'essentia'
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.check_call([
+                sys.executable, '-m', 'pip', 'install', '--quiet', 'essentia-tensorflow'
+            ])
+            print("Essentia with TensorFlow support installed successfully!")
+            needs_restart = True
+    except ImportError:
+        # Essentia not installed
+        print("Installing essentia-tensorflow...")
+        subprocess.check_call([
+            sys.executable, '-m', 'pip', 'install', '--quiet', 'essentia-tensorflow'
+        ])
+        print("Dependencies installed successfully!")
+        needs_restart = True
+
+    # Ensure numpy is installed
+    try:
+        import numpy
+    except ImportError:
+        print("Installing numpy...")
+        subprocess.check_call([
+            sys.executable, '-m', 'pip', 'install', '--quiet', 'numpy'
+        ])
+        print("Numpy installed successfully!")
+        needs_restart = True
+
+    if needs_restart:
+        print("\nRestarting script to load new dependencies...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def configure_gpu():
+    """Configure TensorFlow to use GPU if available."""
+    try:
+        import tensorflow as tf
+
+        # Enable memory growth to prevent TensorFlow from allocating all GPU memory
+        gpus = tf.config.list_physical_devices('GPU')
+
+        if gpus:
+            print(f"\n{'='*80}")
+            print(f"GPU CONFIGURATION")
+            print(f"{'='*80}")
+            print(f"Found {len(gpus)} GPU(s):")
+
+            for i, gpu in enumerate(gpus):
+                print(f"  GPU {i}: {gpu.name}")
+                try:
+                    # Enable memory growth for this GPU
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                    print(f"    ✓ Memory growth enabled")
+                except RuntimeError as e:
+                    print(f"    ✗ Could not set memory growth: {e}")
+
+            # Set visible devices (use all available GPUs)
+            tf.config.set_visible_devices(gpus, 'GPU')
+
+            # Set GPU as default device for all operations
+            # This is critical for Essentia's TensorFlow operations
+            tf.config.set_logical_device_configuration(
+                gpus[0],
+                [tf.config.LogicalDeviceConfiguration(memory_limit=22000)]  # 22GB limit
+            )
+
+            # Log GPU details
+            print(f"\nTensorFlow GPU Configuration:")
+            print(f"  TensorFlow version: {tf.__version__}")
+            print(f"  Built with CUDA: {tf.test.is_built_with_cuda()}")
+            print(f"  GPU device set as default: /GPU:0")
+
+            # Test GPU computation
+            try:
+                with tf.device('/GPU:0'):
+                    test_tensor = tf.random.normal([1000, 1000])
+                    result = tf.matmul(test_tensor, test_tensor)
+                print(f"  ✓ GPU computation test successful")
+                print(f"\n{'='*80}")
+                print(f"✓✓✓ GPU IS CONFIGURED AND READY ✓✓✓")
+                print(f"{'='*80}\n")
+            except Exception as e:
+                print(f"  ✗ GPU test failed: {e}")
+                print(f"{'='*80}\n")
+
+            return True  # GPU available
+
+        else:
+            print(f"\n{'='*80}")
+            print(f"WARNING: No GPU detected - using CPU")
+            print(f"TensorFlow version: {tf.__version__}")
+            print(f"Built with CUDA: {tf.test.is_built_with_cuda()}")
+            print(f"{'='*80}\n")
+            return False  # No GPU
+
+    except ImportError:
+        print("\nTensorFlow not found - GPU configuration skipped")
+        print("Note: Essentia-TensorFlow includes TensorFlow\n")
+        return False
+    except Exception as e:
+        print(f"\nWarning: GPU configuration failed: {e}")
+        print("Continuing with default configuration...\n")
+        return False
+
+
+def get_gpu_memory_usage():
+    """Get current GPU memory usage if available."""
+    try:
+        import tensorflow as tf
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            # This requires nvidia-smi to be available
+            result = subprocess.run(
+                ['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0:
+                lines = result.stdout.strip().split('\n')
+                gpu_info = []
+                for i, line in enumerate(lines):
+                    used, total = line.split(',')
+                    gpu_info.append({
+                        'gpu_id': i,
+                        'used_mb': int(used.strip()),
+                        'total_mb': int(total.strip()),
+                        'percent': (int(used.strip()) / int(total.strip())) * 100
+                    })
+                return gpu_info
+    except Exception:
+        pass
+    return None
+
+
+def download_file(url: str, output_path: Path):
+    """Download a file from URL to output_path."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_path.exists():
+        print(f"  ✓ Already exists: {output_path.name}")
+        return
+
+    print(f"  Downloading: {output_path.name}...")
+    try:
+        urllib.request.urlretrieve(url, output_path)
+        print(f"  ✓ Downloaded: {output_path.name}")
+    except Exception as e:
+        print(f"  ✗ Failed to download {output_path.name}: {e}")
+        raise
+
+
+def ensure_models(models_dir: Path):
+    """Download required Essentia models if they don't exist."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    # Model URLs
+    embedding_base_url = "https://essentia.upf.edu/models/feature-extractors/discogs-effnet/"
+    genre_base_url = "https://essentia.upf.edu/models/classification-heads/mtg_jamendo_genre/"
+    mood_base_url = "https://essentia.upf.edu/models/classification-heads/mtg_jamendo_moodtheme/"
+    instrument_base_url = "https://essentia.upf.edu/models/classification-heads/mtg_jamendo_instrument/"
+
+    models_to_download = [
+        (f"{embedding_base_url}discogs-effnet-bs64-1.pb", models_dir / "discogs-effnet-bs64-1.pb"),
+        (f"{genre_base_url}mtg_jamendo_genre-discogs-effnet-1.pb", models_dir / "mtg_jamendo_genre-discogs-effnet-1.pb"),
+        (f"{genre_base_url}mtg_jamendo_genre-discogs-effnet-1.json", models_dir / "mtg_jamendo_genre-discogs-effnet-1.json"),
+        (f"{mood_base_url}mtg_jamendo_moodtheme-discogs-effnet-1.pb", models_dir / "mtg_jamendo_moodtheme-discogs-effnet-1.pb"),
+        (f"{mood_base_url}mtg_jamendo_moodtheme-discogs-effnet-1.json", models_dir / "mtg_jamendo_moodtheme-discogs-effnet-1.json"),
+        (f"{instrument_base_url}mtg_jamendo_instrument-discogs-effnet-1.pb", models_dir / "mtg_jamendo_instrument-discogs-effnet-1.pb"),
+        (f"{instrument_base_url}mtg_jamendo_instrument-discogs-effnet-1.json", models_dir / "mtg_jamendo_instrument-discogs-effnet-1.json"),
+    ]
+
+    print("Checking/downloading models...")
+    for url, path in models_to_download:
+        download_file(url, path)
+    print("All models ready!\n")
+
+
+# Ensure dependencies are installed first
+ensure_dependencies()
+
+# Configure GPU before importing Essentia (TensorFlow will be configured)
+configure_gpu()
+
+# Now import the packages
 import numpy as np
 import essentia
 import essentia.standard as es
@@ -930,23 +1198,30 @@ def comprehensive_audio_analysis(
 
 # ---- Example usage ----
 if __name__ == "__main__":
-    #test = "/Users/cliftonwest/Documents/Image-Line/FL Studio/Projects/Project_113/Project_113.mp3"
-    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/21_Savage_-_Bank_Account_Official_Audio.webm"
-    test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Commodores_-_Nightshift_Official_Music_Video.webm"
-    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Daft_Punk_-_Veridis_Quo.webm"
-    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Drake_-_Hotline_Bling.webm"
-    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Eddie_Murphy_-_Party_All_the_Time_Official_Video.webm"
-    #test = "/Users/cliftonwest/Documents/GitHub/stem_split/data/raw/uploads/Jack_Harlow_-_Lovin_On_Me_Official_Music_Video.webm"
+    # Setup paths
+    workspace_root = Path("/root/workspace")
+    audio_dir = workspace_root / "data" / "jamendo" / "downloads"
+    models_dir = workspace_root / "data" / "models"
+
+    # Ensure models are downloaded
+    ensure_models(models_dir)
+
+    # Find sample audio files
+    audio_files = sorted(audio_dir.glob("*.mp3"))[:3]  # Use first 3 MP3 files
+    if not audio_files:
+        print(f"No audio files found in {audio_dir}")
+        sys.exit(1)
+
+    test = str(audio_files[0])  # Use first file as test
 
     # Model paths
-    models_dir = "/Users/cliftonwest/Documents/GitHub/Training/models/essentia"
-    embedding_model = f"{models_dir}/discogs-effnet-bs64-1.pb"
-    genre_model = f"{models_dir}/mtg_jamendo_genre-discogs-effnet-1.pb"
-    genre_labels = f"{models_dir}/mtg_jamendo_genre-discogs-effnet-1.json"
-    mood_model = f"{models_dir}/mtg_jamendo_moodtheme-discogs-effnet-1.pb"
-    mood_labels = f"{models_dir}/mtg_jamendo_moodtheme-discogs-effnet-1.json"
-    instrument_model = f"{models_dir}/mtg_jamendo_instrument-discogs-effnet-1.pb"
-    instrument_labels = f"{models_dir}/mtg_jamendo_instrument-discogs-effnet-1.json"
+    embedding_model = str(models_dir / "discogs-effnet-bs64-1.pb")
+    genre_model = str(models_dir / "mtg_jamendo_genre-discogs-effnet-1.pb")
+    genre_labels = str(models_dir / "mtg_jamendo_genre-discogs-effnet-1.json")
+    mood_model = str(models_dir / "mtg_jamendo_moodtheme-discogs-effnet-1.pb")
+    mood_labels = str(models_dir / "mtg_jamendo_moodtheme-discogs-effnet-1.json")
+    instrument_model = str(models_dir / "mtg_jamendo_instrument-discogs-effnet-1.pb")
+    instrument_labels = str(models_dir / "mtg_jamendo_instrument-discogs-effnet-1.json")
 
     print("=" * 80)
     print("COMPREHENSIVE AUDIO ANALYSIS")
@@ -954,7 +1229,18 @@ if __name__ == "__main__":
     print(f"File: {test}")
     print()
 
+    # Show GPU memory before analysis
+    gpu_mem_before = get_gpu_memory_usage()
+    if gpu_mem_before:
+        print(f"GPU Memory (before analysis):")
+        for gpu in gpu_mem_before:
+            print(f"  GPU {gpu['gpu_id']}: {gpu['used_mb']} MB / {gpu['total_mb']} MB ({gpu['percent']:.1f}%)")
+        print()
+
     # Run comprehensive analysis
+    print("Running comprehensive audio analysis...")
+    print("(This may take a minute... GPU will be used for TensorFlow inference)\n")
+
     results = comprehensive_audio_analysis(
         path=test,
         embedding_model_pb=embedding_model,
@@ -965,6 +1251,14 @@ if __name__ == "__main__":
         instrument_model_pb=instrument_model,
         instrument_labels_json=instrument_labels,
     )
+
+    # Show GPU memory after analysis
+    gpu_mem_after = get_gpu_memory_usage()
+    if gpu_mem_after:
+        print("\nGPU Memory (after analysis):")
+        for gpu in gpu_mem_after:
+            print(f"  GPU {gpu['gpu_id']}: {gpu['used_mb']} MB / {gpu['total_mb']} MB ({gpu['percent']:.1f}%)")
+        print()
 
     # Display results
     print("TECHNICAL METADATA")
