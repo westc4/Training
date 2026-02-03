@@ -142,7 +142,7 @@ python --version
 
 # Upgrade pip tooling
 echo "[info] Upgrading pip/setuptools/wheel..."
-python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade pip setuptools wheel aiohttp aiofiles tqdm
 
 # Install packages
 echo "[info] Installing packages: httpx pandas pyarrow tqdm tenacity essentia essentia-tensorflow ffmpeg"
