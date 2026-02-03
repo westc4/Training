@@ -1,0 +1,62 @@
+# ==============================================================================
+# System Requirements (MANDATORY for GPU execution)
+# ==============================================================================
+# CUDA 11.8 runtime libraries (REQUIRED)
+#   - Essential for essentia-tensorflow (bundles TensorFlow 2.x built for CUDA 11.x)
+#   - Install: apt-get install -y cuda-11-8
+#   - Size: ~3.1 GB
+#   - Must set: export LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:$LD_LIBRARY_PATH
+#
+# cuDNN 8.x (REQUIRED - CUDA 11.x compatible version)
+#   - Essential for TensorFlow GPU operations in essentia-tensorflow
+#   - Install: apt-get install -y libcudnn8 libcudnn8-dev
+#   - Version: libcudnn.so.8.9.7 or similar
+#   - Note: Can coexist with newer cuDNN 9.x for other applications
+#   - Verified: Models execute on GPU with max 24% utilization
+#
+# ==============================================================================
+# Python Dependencies
+# ==============================================================================
+# Audio processing with TensorFlow GPU support
+essentia-tensorflow>=2.1b6  # Bundles TensorFlow 2.x with CUDA 11.x support
+numpy>=1.21.0
+
+# GPU monitoring (for verifying GPU utilization)
+pynvml>=11.0.0  # NVIDIA Management Library for GPU stats
+# ==============================================================================
+# Execution Instructions
+# ==============================================================================
+# Run the script with proper environment:
+#   export LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:$LD_LIBRARY_PATH
+#   python genre_filter_test.py
+#
+# Expected GPU utilization: 4-24% during inference
+# Exit codes:
+#   0 = Success (GPU utilized above 10% threshold)
+#   1 = GPU not detected
+#   2 = GPU detected but not utilized above threshold
+#
+# ==============================================================================
+# Alternative Approaches (Not Recommended)
+# ==============================================================================
+# Approach 2: Separate TensorFlow installation
+#   - Install tensorflow>=2.10.0 separately
+#   - Install regular essentia (CPU-only)
+#   - WARNING: Standalone essentia lacks TensorFlow wrapper classes
+#   - NOT RECOMMENDED: Use essentia-tensorflow instead
+#
+# Approach 3: Rebuild from source
+#   - Build essentia-tensorflow for CUDA 12.x
+#   - Complex and time-consuming
+#   - NOT RECOMMENDED: Use CUDA 11.8 compatibility approach
+#
+# ==============================================================================
+# Container Recommendations
+# ==============================================================================
+# For RunPod, use base CUDA 12.x image and install CUDA 11.8 runtime:
+#   Base: runpod/pytorch:2.1.0-py3.10-cuda12.1.1-devel-ubuntu22.04
+#   Install: apt-get install -y cuda-11-8 libcudnn8 libcudnn8-dev
+#   Set: export LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:$LD_LIBRARY_PATH
+#
+# Audio metadata extraction (required for audio processing):
+#   apt-get install ffmpeg

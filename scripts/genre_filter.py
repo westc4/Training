@@ -701,6 +701,27 @@ def analyze_audio_quality(path: str, sr: int = 44100) -> Dict:
     }
 
 
+def load_track_metadata(metadata_path: str = "/root/workspace/data/jamendo/downloaded_tracks_metadata.jsonl") -> Dict:
+    """
+    Load track metadata from JSONL file and return as a dict indexed by filename.
+    """
+    metadata_by_filename = {}
+    try:
+        with open(metadata_path, 'r') as f:
+            for line in f:
+                if line.strip():
+                    entry = json.loads(line)
+                    filename = entry.get('filename')
+                    if filename:
+                        metadata_by_filename[filename] = entry
+    except FileNotFoundError:
+        print(f"Warning: Metadata file not found at {metadata_path}")
+    except Exception as e:
+        print(f"Warning: Error loading metadata: {e}")
+
+    return metadata_by_filename
+
+
 def get_technical_metadata(path: str) -> Dict:
     """
     Extract technical metadata using ffprobe.
@@ -1468,6 +1489,50 @@ if __name__ == "__main__":
         sad_model_pb=sad_model,
         tonal_atonal_model_pb=tonal_atonal_model,
     )
+
+    # Load track metadata and cross-reference
+    print("Loading track metadata...")
+    track_metadata_dict = load_track_metadata()
+    test_filename = Path(test).name
+    track_metadata = track_metadata_dict.get(test_filename, {})
+
+    if track_metadata:
+        print(f"  ✓ Found metadata for: {test_filename}")
+        # Add track metadata to results
+        results["track_metadata"] = track_metadata
+    else:
+        print(f"  ✗ No metadata found for: {test_filename}")
+        results["track_metadata"] = None
+
+    # Save results to JSON in data/jamendo directory
+    output_dir = Path("/root/workspace/data/jamendo")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_json_path = output_dir / f"{Path(test).stem}_analysis.json"
+
+    # Convert numpy types to native Python types for JSON serialization
+    def convert_to_serializable(obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64,
+                             np.uint8, np.uint16, np.uint32, np.uint64)):
+            return int(obj)
+        elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, dict):
+            return {key: convert_to_serializable(value) for key, value in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [convert_to_serializable(item) for item in obj]
+        return obj
+
+    serializable_results = convert_to_serializable(results)
+
+    with open(output_json_path, 'w') as f:
+        json.dump(serializable_results, f, indent=2)
+
+    print(f"Results saved to: {output_json_path}")
+    print()
 
     # Display results
     print("TECHNICAL METADATA")

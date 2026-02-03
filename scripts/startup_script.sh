@@ -9,7 +9,7 @@ echo "[startup] Updating apt + installing utilities..."
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl unzip git tar \
-  nload iftop bmon jq
+  nload iftop bmon jq ffmpeg
 apt-get update && apt-get install -y dstat
 apt-get update && apt-get install -y iotop
 
@@ -145,8 +145,8 @@ echo "[info] Upgrading pip/setuptools/wheel..."
 python -m pip install --upgrade pip setuptools wheel
 
 # Install packages
-echo "[info] Installing packages: httpx pandas pyarrow tqdm tenacity"
-python -m pip install --upgrade httpx pandas pyarrow tqdm tenacity
+echo "[info] Installing packages: httpx pandas pyarrow tqdm tenacity essentia essentia-tensorflow ffmpeg"
+python -m pip install --upgrade httpx pandas pyarrow tqdm tenacity essentia essentia-tensorflow ffmpeg
 
 echo "[done] Installed into venv: ${VENV_DIR}"
 echo "To use it now: source ${VENV_DIR}/bin/activate"
