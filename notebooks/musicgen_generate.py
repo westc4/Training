@@ -215,6 +215,46 @@ def main():
     print(f"  Frame rate: {frame_rate} Hz")
     print(f"  Codebooks: {n_q}")
     
+    # ==========================================================================
+    # CODEC QUALITY CHECK
+    # Warn if compression model may not be converged
+    # ==========================================================================
+    print(f"\n{'='*60}")
+    print("Codec Quality Check")
+    print(f"{'='*60}")
+    
+    # Try to load training history to check SI-SNR
+    compression_history = compression_xp / "history.json"
+    if compression_history.exists():
+        try:
+            import json
+            with open(compression_history) as f:
+                history = json.load(f)
+            if history:
+                last_epoch = history[-1]
+                train_metrics = last_epoch.get("train", {})
+                sisnr = train_metrics.get("sisnr", None)
+                mel = train_metrics.get("mel", None)
+                epochs_trained = len(history)
+                
+                print(f"  Compression epochs trained: {epochs_trained}")
+                if sisnr is not None:
+                    print(f"  Final SI-SNR: {sisnr:.2f} dB")
+                    if sisnr < 0:
+                        print(f"  ⚠️  WARNING: Negative SI-SNR indicates codec NOT converged!")
+                        print(f"     Audio quality will be severely degraded.")
+                        print(f"     Recommend training compression model longer (target: SI-SNR > +5 dB)")
+                    elif sisnr < 5:
+                        print(f"  ⚠️  WARNING: Low SI-SNR - codec may need more training")
+                    else:
+                        print(f"  ✓ SI-SNR looks reasonable")
+                if mel is not None:
+                    print(f"  Final Mel Loss: {mel:.4f}")
+        except Exception as e:
+            print(f"  Could not check codec quality: {e}")
+    else:
+        print(f"  No history.json found - cannot verify codec quality")
+    
     # Load LM model config
     hydra_config = musicgen_xp / ".hydra" / "config.yaml"
     if not hydra_config.exists():
@@ -227,8 +267,62 @@ def main():
     cfg = omegaconf.OmegaConf.load(hydra_config)
     cfg.device = device
     
+    # ==========================================================================
+    # LM QUALITY CHECK  
+    # Verify codec-LM compatibility and check training metrics
+    # ==========================================================================
+    print(f"\n{'='*60}")
+    print("LM Quality Check")
+    print(f"{'='*60}")
+    
+    # Check codec-LM compatibility
+    lm_n_q = cfg.transformer_lm.get("n_q", None)
+    lm_card = cfg.transformer_lm.get("card", None)
+    print(f"  Compression n_q: {n_q}, LM n_q: {lm_n_q}")
+    print(f"  Compression bins: 2048 (assumed), LM card: {lm_card}")
+    
+    if lm_n_q is not None and n_q is not None and lm_n_q != n_q:
+        raise ValueError(f"MISMATCH: Compression n_q={n_q} != LM n_q={lm_n_q}")
+    
+    # Check MusicGen training metrics
+    musicgen_history = musicgen_xp / "history.json"
+    if musicgen_history.exists():
+        try:
+            import json
+            with open(musicgen_history) as f:
+                history = json.load(f)
+            if history:
+                first_epoch = history[0].get("train", {})
+                last_epoch = history[-1].get("train", {})
+                
+                ppl_start = first_epoch.get("ppl", None)
+                ppl_end = last_epoch.get("ppl", None)
+                epochs_trained = len(history)
+                
+                print(f"  MusicGen epochs trained: {epochs_trained}")
+                if ppl_start and ppl_end:
+                    ppl_reduction = (ppl_start - ppl_end) / ppl_start * 100
+                    print(f"  Perplexity: {ppl_start:.1f} → {ppl_end:.1f} ({ppl_reduction:.1f}% reduction)")
+                    
+                    if ppl_end > 1000:
+                        print(f"  ⚠️  WARNING: Very high perplexity - model barely learning!")
+                        print(f"     Expected converged ppl: 50-200. Current: {ppl_end:.0f}")
+                    elif ppl_end > 500:
+                        print(f"  ⚠️  Perplexity still high - consider more training")
+                    else:
+                        print(f"  ✓ Perplexity looks reasonable")
+                
+                # Count INF gradients
+                inf_count = sum(1 for e in history 
+                              if e.get("train", {}).get("grad_norm", 0) == float('inf'))
+                if inf_count > 0:
+                    pct = inf_count / len(history) * 100
+                    print(f"  ⚠️  INF gradients: {inf_count}/{epochs_trained} epochs ({pct:.0f}%)")
+        except Exception as e:
+            print(f"  Could not check LM quality: {e}")
+    
     # Build and load LM model
-    print(f"Building LM model...")
+    print(f"\nBuilding LM model...")
     lm_model = get_lm_model(cfg)
     
     print(f"Loading LM weights from {musicgen_ckpt.name}...")

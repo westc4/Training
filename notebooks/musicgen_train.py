@@ -70,9 +70,9 @@ CONDITIONER = "none"
 # =============================================================================
 
 SEGMENT_SECONDS = 60        # Audio segment duration in seconds
-BATCH_SIZE = 64              # Per-GPU batch size (must be divisible by WORLD_SIZE)
+BATCH_SIZE = 32             # Reduced from 64 for more stable gradients per update
 NUM_WORKERS = 8             # DataLoader workers per GPU
-EPOCHS = 100                # Total training epochs (if not using target hours)
+EPOCHS = 200                # Increased from 100 - unconditional training needs more epochs
 
 # === AUTO-SCALE UPDATES PER EPOCH ===
 # Option 1: Use full dataset (set to None for auto-detection)
@@ -85,8 +85,10 @@ GENERATE_EVERY = "null"     # Generate samples every N epochs ("null" to disable
 EVALUATE_EVERY = 10         # Evaluate every N epochs
 
 # Optimization
-LEARNING_RATE = 1e-4
-MAX_NORM = 1.0              # Gradient clipping norm
+# NOTE: Previous run showed 33% of epochs had INF grad_norm and minimal ppl improvement
+# Reducing LR and max_norm for more stable training
+LEARNING_RATE = 5e-5        # Reduced from 1e-4 for stability (INF gradients were common)
+MAX_NORM = 0.5              # Reduced from 1.0 for tighter gradient control
 AUTOCAST = True             # Use mixed precision (fp16/bf16)
 
 # Checkpointing
