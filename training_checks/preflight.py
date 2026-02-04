@@ -60,6 +60,9 @@ class PreflightConfig:
     roundtrip_samples: int = 4
     roundtrip_min_snr_db: float = 5.0    # Minimum acceptable SI-SNR
     
+    # Skip flags
+    skip_compression_check: bool = False  # Skip compression compatibility for compression training
+    
     # DDP
     world_size: Optional[int] = None     # None = auto-detect
     
@@ -799,13 +802,21 @@ def run_preflight(config: PreflightConfig) -> tuple[bool, PreflightResults]:
     print("[3/6] Checking segment duration feasibility...")
     check_segment_duration(config, results)
     
-    # Task 2A: Compression compatibility
-    print("[4/6] Checking compression-LM compatibility...")
-    check_compression_compatibility(config, results)
+    # Task 2A: Compression compatibility (skip for compression training)
+    if config.skip_compression_check:
+        print("[4/6] Skipping compression-LM compatibility (compression training mode)")
+        results.add_ok("compression_lm_compatibility", "Skipped (compression training mode)")
+    else:
+        print("[4/6] Checking compression-LM compatibility...")
+        check_compression_compatibility(config, results)
     
-    # Task 2B: Compression roundtrip (optional, can be slow)
-    print("[5/6] Running compression roundtrip test...")
-    check_compression_roundtrip(config, results)
+    # Task 2B: Compression roundtrip (skip for compression training)
+    if config.skip_compression_check:
+        print("[5/6] Skipping compression roundtrip test (compression training mode)")
+        results.add_ok("compression_roundtrip", "Skipped (compression training mode)")
+    else:
+        print("[5/6] Running compression roundtrip test...")
+        check_compression_roundtrip(config, results)
     
     # Task 3A/3B: Training config
     print("[6/6] Validating training configuration...")
