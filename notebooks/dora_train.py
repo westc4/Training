@@ -11,6 +11,7 @@ Usage:
     python dora_train.py                    # Normal training
     python dora_train.py --preflight-only   # Run checks only
     python dora_train.py --skip-preflight   # Skip checks
+    python dora_train.py --codec-check-every 5 --codec-check-samples 10 # Run codec quality check every 5 epochs with 10 samples
 """
 
 from pathlib import Path
@@ -43,9 +44,21 @@ DSET = "audio/all_data"
 SOLVER = "compression/encodec_musicgen_32khz"
 
 #SEGMENT_SECONDS = 10
-SEGMENT_SECONDS = 60
-BATCH_SIZE = 12  # Must be divisible by WORLD_SIZE (num GPUs). For 4 GPUs: 4, 8, 12, etc.
+SEGMENT_SECONDS = 30  # Changed from 60: only 45% of clips are >=60s, but 89% are >=30s
+BATCH_SIZE = 1  # Must be divisible by WORLD_SIZE (num GPUs). For 4 GPUs: 4, 8, 12, etc.
 #BATCH_SIZE = 64  # Increased from 8 to improve GPU utilization
+
+# =============================================================================
+# TRAINING HYPERPARAMETERS (CRITICAL FOR CONVERGENCE)
+# =============================================================================
+# Previous runs showed SI-SNR collapse (-2.2 dB) due to:
+#   1. No gradient clipping (max_norm=0.0)
+#   2. Too few epochs (24 vs needed 100-200)
+#   3. Learning rate potentially too high for adversarial training
+
+LEARNING_RATE = 0.0001      # Reduced from 0.0003 for stability
+MAX_NORM = 1.0              # CRITICAL: Enable gradient clipping (was 0.0!)
+EPOCHS = 200                # Full training (was stopping at ~24)
 
 # Auto-pick workers: reduce to 4-6 to avoid CPU contention
 _cpu_count = os.cpu_count() or 32
@@ -56,7 +69,7 @@ NUM_WORKERS = 16 # this worked well on v84 cpu
 # === AUTO-SCALE UPDATES PER EPOCH ===
 # Option 1: Use full dataset (set to None for auto-detection)
 # Option 2: Set target hours to use a subset (e.g., 100, 500, 3791 for full dataset)
-TARGET_HOURS = 500  # None = use full dataset, or set a number like 100, 500, etc.
+TARGET_HOURS = 1  # None = use full dataset, or set a number like 100, 500, etc.
 
 # Detect world size for DDP (Distributed Data Parallel)
 def _get_world_size():
@@ -129,8 +142,14 @@ else:
 
 VALID_NUM_SAMPLES = 10
 GENERATE_EVERY = "null"  # Disable automatic generation during training
-EVALUATE_EVERY = "null"  # Disable automatic evaluation during training
+EVALUATE_EVERY = 10       # Evaluate every 10 epochs to monitor SI-SNR
 AUTOCAST = True
+
+# =============================================================================
+# CODEC QUALITY CHECK CONFIGURATION
+# =============================================================================
+CODEC_CHECK_EVERY = 1     # Run codec quality check every N epochs (0=disabled)
+CODEC_CHECK_SAMPLES = 5    # Number of samples to test per check
 # NUM_THREADS = 16  # Set number of threads for PyTorch operations
 NUM_THREADS = 2  # Set number of threads for PyTorch operations
 #MP_START_METHOD = "fork" # Use 'fork' to reduce overhead on Linux systems
@@ -143,6 +162,13 @@ CHECKPOINT_SAVE = 10000  # Save checkpoint every N optimizer steps (NOT per epoc
 CONFIG_PATH = AUDIOCRAFT_REPO_DIR / "config" / "dset" / "audio" / "all_data.yaml"
 TRAIN_JSONL  = BASE_DIR / "data" / "all_data" / "egs" / "train" / "data.jsonl"
 VALID_JSONL  = BASE_DIR / "data" / "all_data" / "egs" / "valid" / "data.jsonl"
+
+CODEC_CHECK_OUTPUT_DIR = BASE_DIR / "Training" / "outputs" / "codec_quality_check"
+
+if CODEC_CHECK_EVERY > 0:
+    print(f"\n=== Codec Quality Check ===")
+    print(f"Running every {CODEC_CHECK_EVERY} epochs with {CODEC_CHECK_SAMPLES} samples")
+    print(f"Output: {CODEC_CHECK_OUTPUT_DIR}")
 
 print(NUM_WORKERS)
 print(CONFIG_PATH)
@@ -176,6 +202,7 @@ def run_preflight_checks():
         expected_sample_rate=32000,
         expected_channels=1,
         world_size=WORLD_SIZE,
+        skip_compression_check=True,  # Skip for compression training (no checkpoint exists yet)
     )
     
     return run_preflight(config)
@@ -267,9 +294,10 @@ env["PYTHONWARNINGS"] = "ignore::FutureWarning,ignore::UserWarning"
 _kill_proc_tree(_DORA_PROC)
 print(f"Using config: dset={DSET}, solver={SOLVER}")
 print(f"Training params: segment_duration={SEGMENT_SECONDS}, batch_size={BATCH_SIZE}, num_workers={NUM_WORKERS}")
-print(f"Optimizer: updates_per_epoch={UPDATES_PER_EPOCH}")
+print(f"Optimizer: updates_per_epoch={UPDATES_PER_EPOCH}, epochs={EPOCHS}, lr={LEARNING_RATE}")
+print(f"Gradient clipping: max_norm={MAX_NORM}  ← CRITICAL for stability")
 print(f"Validation: num_samples={VALID_NUM_SAMPLES}")
-print(f"Evaluate every: {EVALUATE_EVERY}")
+print(f"Evaluate every: {EVALUATE_EVERY} epochs  ← Monitor SI-SNR here!")
 print(f"Autocast: {AUTOCAST}")
 print(f"Generate every: {GENERATE_EVERY}")
 print(f"Num threads: {NUM_THREADS}")
@@ -287,6 +315,9 @@ cmd = [
     f"dataset.generate.batch_size={DATASET_BATCH_SIZE}",
     f"dataset.num_workers={NUM_WORKERS}",
     f"optim.updates_per_epoch={UPDATES_PER_EPOCH}",
+    f"optim.epochs={EPOCHS}",
+    f"optim.lr={LEARNING_RATE}",
+    f"optim.max_norm={MAX_NORM}",  # CRITICAL: Gradient clipping to prevent divergence
     f"dataset.valid.num_samples={VALID_NUM_SAMPLES}",
     f"generate.every={GENERATE_EVERY}",
     f"evaluate.every={EVALUATE_EVERY}",
@@ -294,27 +325,187 @@ cmd = [
     f"num_threads={NUM_THREADS}",
     f"mp_start_method={MP_START_METHOD}",
     f"checkpoint.save_every={CHECKPOINT_SAVE}",
-    
 ]
 #f"dataset.num_samples={DATASET_NUM_SAMPLES}",
 print("Launching:", " ".join(shlex.quote(x) for x in cmd))
 print("Dora dir:", env["AUDIOCRAFT_DORA_DIR"])
 
-# ---- Start in the repo directory + new process group so we can kill all workers ----
-_DORA_PROC = subprocess.Popen(
-    cmd,
-    cwd=str(AUDIOCRAFT_REPO_DIR),
-    env=env,
-    start_new_session=True,   # <-- creates a new process group/session
-    stdout=None,
-    stderr=None,
-)
+# =============================================================================
+# CODEC QUALITY CHECK INTEGRATION
+# =============================================================================
 
-# Optional: wait for completion (Ctrl-C will stop this cell; atexit will still clean up on kernel exit)
-try:
-    rc = _DORA_PROC.wait()
-    if rc != 0:
-        raise RuntimeError(f"Dora exited with code {rc}")
-finally:
-    _kill_proc_tree(_DORA_PROC)
-    _DORA_PROC = None
+import re
+import threading
+import queue
+
+def run_codec_quality_check(checkpoint_path: Path, epoch: int, num_samples: int, output_dir: Path):
+    """Run codec quality check in a subprocess."""
+    print(f"\n{'='*60}")
+    print(f"CODEC QUALITY CHECK - Epoch {epoch}")
+    print(f"{'='*60}")
+    
+    check_script = BASE_DIR / "Training" / "training_checks" / "codec_quality_check.py"
+    if not check_script.exists():
+        print(f"Warning: {check_script} not found, skipping codec check")
+        return
+    
+    check_cmd = [
+        "python", str(check_script),
+        "--checkpoint", str(checkpoint_path),
+        "--num-samples", str(num_samples),
+        "--output-dir", str(output_dir / f"epoch_{epoch:04d}"),
+    ]
+    
+    try:
+        result = subprocess.run(
+            check_cmd,
+            cwd=str(BASE_DIR),
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 minute timeout
+        )
+        print(result.stdout)
+        if result.stderr:
+            print(f"Stderr: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        print("Codec check timed out (5 min)")
+    except Exception as e:
+        print(f"Codec check failed: {e}")
+    
+    print(f"{'='*60}\n")
+
+
+def find_latest_checkpoint():
+    """Find the latest compression checkpoint."""
+    xps_dir = EXPERIMENTS_DIR / "xps"
+    if not xps_dir.exists():
+        return None
+    
+    compression_checkpoints = []
+    for xp_dir in xps_dir.iterdir():
+        if not xp_dir.is_dir():
+            continue
+        
+        config_path = xp_dir / ".hydra" / "config.yaml"
+        checkpoint_path = xp_dir / "checkpoint.th"
+        
+        if config_path.exists() and checkpoint_path.exists():
+            try:
+                import yaml
+                with open(config_path) as f:
+                    cfg = yaml.safe_load(f)
+                if cfg.get("solver") == "compression":
+                    compression_checkpoints.append(checkpoint_path)
+            except:
+                pass
+    
+    if not compression_checkpoints:
+        return None
+    
+    # Return most recently modified
+    compression_checkpoints.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return compression_checkpoints[0]
+
+
+def monitor_training_output(proc, output_queue):
+    """Thread to read process stdout and detect epoch completions."""
+    epoch_pattern = re.compile(r"Train Summary \| Epoch (\d+)")
+    
+    for line in iter(proc.stdout.readline, ''):
+        if not line:
+            break
+        # Pass through to console
+        print(line, end='', flush=True)
+        # Check for epoch completion
+        match = epoch_pattern.search(line)
+        if match:
+            epoch = int(match.group(1))
+            output_queue.put(('epoch', epoch))
+    
+    output_queue.put(('done', None))
+
+
+# ---- Start in the repo directory + new process group so we can kill all workers ----
+if CODEC_CHECK_EVERY > 0:
+    # Use PIPE to monitor output for epoch completions
+    _DORA_PROC = subprocess.Popen(
+        cmd,
+        cwd=str(AUDIOCRAFT_REPO_DIR),
+        env=env,
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,  # Line buffered
+    )
+    
+    # Start output monitor thread
+    epoch_queue = queue.Queue()
+    monitor_thread = threading.Thread(
+        target=monitor_training_output,
+        args=(_DORA_PROC, epoch_queue),
+        daemon=True
+    )
+    monitor_thread.start()
+    
+    # Main loop: check for epoch completions and run codec check
+    last_checked_epoch = 0
+    try:
+        while True:
+            try:
+                msg_type, value = epoch_queue.get(timeout=1)
+                
+                if msg_type == 'done':
+                    break
+                
+                if msg_type == 'epoch':
+                    epoch = value
+                    # Check if we should run codec check
+                    if epoch > 0 and epoch % CODEC_CHECK_EVERY == 0 and epoch > last_checked_epoch:
+                        last_checked_epoch = epoch
+                        checkpoint = find_latest_checkpoint()
+                        if checkpoint:
+                            run_codec_quality_check(
+                                checkpoint_path=checkpoint,
+                                epoch=epoch,
+                                num_samples=CODEC_CHECK_SAMPLES,
+                                output_dir=CODEC_CHECK_OUTPUT_DIR,
+                            )
+                        else:
+                            print(f"No checkpoint found at epoch {epoch}, skipping codec check")
+            
+            except queue.Empty:
+                # Check if process is still running
+                if _DORA_PROC.poll() is not None:
+                    break
+    
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    
+    finally:
+        rc = _DORA_PROC.poll()
+        if rc is None:
+            _kill_proc_tree(_DORA_PROC)
+            rc = -1
+        _DORA_PROC = None
+        if rc != 0:
+            print(f"Dora exited with code {rc}")
+
+else:
+    # Original behavior: no codec check, just run training
+    _DORA_PROC = subprocess.Popen(
+        cmd,
+        cwd=str(AUDIOCRAFT_REPO_DIR),
+        env=env,
+        start_new_session=True,
+        stdout=None,
+        stderr=None,
+    )
+    
+    try:
+        rc = _DORA_PROC.wait()
+        if rc != 0:
+            raise RuntimeError(f"Dora exited with code {rc}")
+    finally:
+        _kill_proc_tree(_DORA_PROC)
+        _DORA_PROC = None
