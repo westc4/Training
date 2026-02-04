@@ -1,0 +1,42 @@
+# @package __global__
+#
+# Task 4: Curriculum Learning - Medium Sequence Variant (20s)
+#
+# Intermediate step in curriculum:
+# 1. Start with short_10s for initial learning
+# 2. Progress to medium_20s for structure learning
+# 3. Finally use full 30-60s for long-form coherence
+#
+# Usage:
+#   python -m dora run solver=musicgen/musicgen_base_32khz \
+#       dset=audio/all_data \
+#       +curriculum/medium_20s
+
+defaults:
+  - /solver/musicgen/musicgen_base_32khz
+  - _self_
+
+# Medium sequence curriculum settings
+dataset:
+  segment_duration: 20    # Middle ground
+  batch_size: 64          # Balance between throughput and memory
+  min_segment_ratio: 0.8
+
+# Optimization for curriculum phase 2
+optim:
+  epochs: 50
+  updates_per_epoch: 3000
+  lr: 5e-5                # Slightly lower LR for fine-tuning
+  max_norm: 1.0
+
+checkpoint:
+  save_every: 2000
+  keep_last: 5
+
+evaluate:
+  every: 10
+
+generate:
+  every: 10
+  lm:
+    gen_duration: 20
