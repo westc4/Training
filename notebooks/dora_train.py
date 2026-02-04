@@ -1,5 +1,35 @@
+#!/usr/bin/env python3
+"""
+Compression Model Training Script with Preflight Checks
+
+Trains AudioCraft compression models (EnCodec) with:
+- Preflight validation of datasets, configs, and environment
+- Target hours mode for subset training
+- Multi-GPU DDP support
+
+Usage:
+    python dora_train.py                    # Normal training
+    python dora_train.py --preflight-only   # Run checks only
+    python dora_train.py --skip-preflight   # Skip checks
+"""
+
 from pathlib import Path
 import os
+import sys
+import argparse
+
+# =============================================================================
+# CLI ARGUMENTS
+# =============================================================================
+
+parser = argparse.ArgumentParser(description="Train AudioCraft compression model")
+parser.add_argument("--preflight-only", action="store_true", help="Run preflight checks only, don't train")
+parser.add_argument("--skip-preflight", action="store_true", help="Skip preflight checks")
+args, _ = parser.parse_known_args()
+
+# =============================================================================
+# PATH CONFIGURATION  
+# =============================================================================
 
 # Single switch for all paths (defaults to your new location)
 BASE_DIR = Path(os.environ.get("WORKSPACE_DIR", "/root/workspace"))
@@ -9,12 +39,12 @@ EXPERIMENTS_DIR     = BASE_DIR / "experiments" / "audiocraft"
 
 #DSET = "audio/all_data"
 DSET = "audio/all_data"
-SOLVER = "compression/debug"
-#SOLVER = "compression/encodec_musicgen_32khz"
+#SOLVER = "compression/debug"
+SOLVER = "compression/encodec_musicgen_32khz"
 
 #SEGMENT_SECONDS = 10
 SEGMENT_SECONDS = 60
-BATCH_SIZE = 8  # Lower to 4 if training on 60s increase to 32 for 10s
+BATCH_SIZE = 12  # Must be divisible by WORLD_SIZE (num GPUs). For 4 GPUs: 4, 8, 12, etc.
 #BATCH_SIZE = 64  # Increased from 8 to improve GPU utilization
 
 # Auto-pick workers: reduce to 4-6 to avoid CPU contention
@@ -26,7 +56,7 @@ NUM_WORKERS = 16 # this worked well on v84 cpu
 # === AUTO-SCALE UPDATES PER EPOCH ===
 # Option 1: Use full dataset (set to None for auto-detection)
 # Option 2: Set target hours to use a subset (e.g., 100, 500, 3791 for full dataset)
-TARGET_HOURS = 10  # None = use full dataset, or set a number like 100, 500, etc.
+TARGET_HOURS = 500  # None = use full dataset, or set a number like 100, 500, etc.
 
 # Detect world size for DDP (Distributed Data Parallel)
 def _get_world_size():
@@ -106,7 +136,7 @@ NUM_THREADS = 2  # Set number of threads for PyTorch operations
 #MP_START_METHOD = "fork" # Use 'fork' to reduce overhead on Linux systems
 #MP_START_METHOD = "fork" # Alternative method if issues arise with 'fork'
 MP_START_METHOD = "fork" # Alternative method if issues arise with 'fork'
-DATASET_BATCH_SIZE = 1 # Batch size for multi gpu setup
+DATASET_BATCH_SIZE = 4 # Batch size for multi gpu setup
 DATASET_NUM_SAMPLES = 2000
 CHECKPOINT_SAVE = 10000  # Save checkpoint every N optimizer steps (NOT per epoch)
 
@@ -119,6 +149,70 @@ print(CONFIG_PATH)
 print(TRAIN_JSONL)
 print(VALID_JSONL)
 print(AUDIOCRAFT_REPO_DIR)
+
+# =============================================================================
+# PREFLIGHT CHECKS
+# =============================================================================
+
+# Add training_checks to path
+sys.path.insert(0, str(BASE_DIR / "Training"))
+
+from training_checks.preflight import run_preflight, PreflightConfig
+from training_checks.reporting import PreflightReport, save_report
+
+def run_preflight_checks():
+    """Run preflight checks and return (passed, results)."""
+    config = PreflightConfig(
+        audiocraft_repo=AUDIOCRAFT_REPO_DIR,
+        experiments_dir=EXPERIMENTS_DIR,
+        data_dir=BASE_DIR / "data",
+        dset=DSET,
+        train_jsonl=TRAIN_JSONL,
+        valid_jsonl=VALID_JSONL,
+        segment_duration=SEGMENT_SECONDS,
+        batch_size=BATCH_SIZE,
+        num_workers=NUM_WORKERS,
+        target_hours=TARGET_HOURS,
+        expected_sample_rate=32000,
+        expected_channels=1,
+        world_size=WORLD_SIZE,
+    )
+    
+    return run_preflight(config)
+
+# Run preflight checks unless skipped
+if not args.skip_preflight:
+    preflight_ok, preflight_results = run_preflight_checks()
+    
+    # Save report to experiments directory
+    report = PreflightReport.from_results(preflight_results)
+    xp_preflight_dir = EXPERIMENTS_DIR / "preflight_reports"
+    xp_preflight_dir.mkdir(parents=True, exist_ok=True)
+    
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    json_path, text_path = save_report(
+        report,
+        xp_preflight_dir,
+        json_filename=f"preflight_{timestamp}.json",
+        text_filename=f"preflight_{timestamp}.txt",
+    )
+    print(f"\nPreflight report saved to:")
+    print(f"  JSON: {json_path}")
+    print(f"  Text: {text_path}")
+    
+    if args.preflight_only:
+        print("\n--preflight-only specified, exiting.")
+        sys.exit(0 if preflight_ok else 1)
+    
+    if not preflight_ok:
+        print("\n❌ Preflight checks FAILED. Training will not start.")
+        print("   Use --skip-preflight to override (not recommended)")
+        sys.exit(1)
+
+# =============================================================================
+# PROCESS MANAGEMENT
+# =============================================================================
 
 import os
 import shlex
