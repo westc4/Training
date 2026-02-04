@@ -1,0 +1,50 @@
+{
+  "timestamp": "20260204_193655",
+  "compression_checkpoint": "/root/workspace/experiments/audiocraft/xps/528474a5/checkpoint.th",
+  "musicgen_checkpoint": "/root/workspace/experiments/audiocraft/xps/f86fb7e9/checkpoint.th",
+  "musicgen_xp": "f86fb7e9",
+  "sample_rate": 32000,
+  "frame_rate": 50,
+  "num_codebooks": 4,
+  "generation_settings": {
+    "num_samples": 4,
+    "duration_seconds": 8.0,
+    "use_sampling": true,
+    "temperature": 0.5,
+    "top_k": 250,
+    "top_p": 0.0,
+    "base_seed": 2026,
+    "force_unique_seeds": true,
+    "prompt": "A warm synth pad"
+  },
+  "generated_files": [
+    {
+      "path": "/root/workspace/Training/outputs/generated/generated_20260204_193655_000.wav",
+      "filename": "generated_20260204_193655_000.wav",
+      "duration_sec": 8.0,
+      "rms": 0.2499,
+      "peak": 1.1662
+    },
+    {
+      "path": "/root/workspace/Training/outputs/generated/generated_20260204_193655_001.wav",
+      "filename": "generated_20260204_193655_001.wav",
+      "duration_sec": 8.0,
+      "rms": 0.2465,
+      "peak": 1.0969
+    },
+    {
+      "path": "/root/workspace/Training/outputs/generated/generated_20260204_193655_002.wav",
+      "filename": "generated_20260204_193655_002.wav",
+      "duration_sec": 8.0,
+      "rms": 0.2629,
+      "peak": 1.1889
+    },
+    {
+      "path": "/root/workspace/Training/outputs/generated/generated_20260204_193655_003.wav",
+      "filename": "generated_20260204_193655_003.wav",
+      "duration_sec": 8.0,
+      "rms": 0.2517,
+      "peak": 1.1517
+    }
+  ]
+}
