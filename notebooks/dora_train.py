@@ -6,12 +6,26 @@ Trains AudioCraft compression models (EnCodec) with:
 - Preflight validation of datasets, configs, and environment
 - Target hours mode for subset training
 - Multi-GPU DDP support
+- Optional adversarial loss tuning via environment variables
 
 Usage:
     python dora_train.py                    # Normal training
     python dora_train.py --preflight-only   # Run checks only
     python dora_train.py --skip-preflight   # Skip checks
     python dora_train.py --codec-check-every 5 --codec-check-samples 10 # Run codec quality check every 5 epochs with 10 samples
+
+Adversarial Training Toggles (env vars):
+    # Reduce adversarial weights (losses.adv=2.0, losses.feat=2.0):
+    REDUCE_ADV=1 python -u dora_train.py
+
+    # Update discriminator every 2 steps:
+    ADV_EVERY=2 python -u dora_train.py
+
+    # Scale adversarial losses to 50% (takes priority over REDUCE_ADV):
+    ADV_SCALE=0.5 python -u dora_train.py
+
+    # Scale + change update frequency:
+    ADV_SCALE=0.5 ADV_EVERY=2 python -u dora_train.py
 """
 
 from pathlib import Path
@@ -45,7 +59,7 @@ SOLVER = "compression/encodec_musicgen_32khz"
 
 #SEGMENT_SECONDS = 10
 SEGMENT_SECONDS = 30  # Changed from 60: only 45% of clips are >=60s, but 89% are >=30s
-BATCH_SIZE = 1  # Must be divisible by WORLD_SIZE (num GPUs). For 4 GPUs: 4, 8, 12, etc.
+BATCH_SIZE = 24  # Must be divisible by WORLD_SIZE (num GPUs). For 4 GPUs: 4, 8, 12, etc.
 #BATCH_SIZE = 64  # Increased from 8 to improve GPU utilization
 
 # =============================================================================
@@ -69,7 +83,7 @@ NUM_WORKERS = 16 # this worked well on v84 cpu
 # === AUTO-SCALE UPDATES PER EPOCH ===
 # Option 1: Use full dataset (set to None for auto-detection)
 # Option 2: Set target hours to use a subset (e.g., 100, 500, 3791 for full dataset)
-TARGET_HOURS = 1  # None = use full dataset, or set a number like 100, 500, etc.
+TARGET_HOURS = 500  # None = use full dataset, or set a number like 100, 500, etc.
 
 # Detect world size for DDP (Distributed Data Parallel)
 def _get_world_size():
@@ -151,7 +165,7 @@ AUTOCAST = True
 CODEC_CHECK_EVERY = 1     # Run codec quality check every N epochs (0=disabled)
 CODEC_CHECK_SAMPLES = 5    # Number of samples to test per check
 # NUM_THREADS = 16  # Set number of threads for PyTorch operations
-NUM_THREADS = 2  # Set number of threads for PyTorch operations
+NUM_THREADS = 8  # Set number of threads for PyTorch operations
 #MP_START_METHOD = "fork" # Use 'fork' to reduce overhead on Linux systems
 #MP_START_METHOD = "fork" # Alternative method if issues arise with 'fork'
 MP_START_METHOD = "fork" # Alternative method if issues arise with 'fork'
@@ -169,6 +183,112 @@ if CODEC_CHECK_EVERY > 0:
     print(f"\n=== Codec Quality Check ===")
     print(f"Running every {CODEC_CHECK_EVERY} epochs with {CODEC_CHECK_SAMPLES} samples")
     print(f"Output: {CODEC_CHECK_OUTPUT_DIR}")
+
+# =============================================================================
+# ADVERSARIAL TRAINING OVERRIDES
+# =============================================================================
+# Set these directly OR use env vars (env vars take priority if set)
+#
+# Options:
+#   REDUCE_ADV = True   → losses.adv=2.0, losses.feat=2.0 (half of default)
+#   ADV_SCALE  = 0.5    → losses.adv=2.0, losses.feat=2.0 (50% of default)
+#   ADV_EVERY  = 2      → adversarial.every=2 (update discriminator every 2 steps)
+#
+# Priority: ADV_SCALE > REDUCE_ADV (if both set, ADV_SCALE wins)
+# Set to None to use defaults (losses.adv=4.0, losses.feat=4.0, adversarial.every=1)
+
+REDUCE_ADV = True      # Set to True to halve adversarial weights (losses.adv=2.0, losses.feat=2.0)
+ADV_SCALE  = None      # Set to float (e.g., 0.5) to scale adversarial weights. Takes priority over REDUCE_ADV
+ADV_EVERY  = 2      # Set to int >= 1 to change discriminator update frequency
+
+# Defaults (from compression/encodec_musicgen_32khz.yaml)
+BASE_ADV_LOSS = 4.0
+BASE_FEAT_LOSS = 4.0
+
+def get_adversarial_overrides():
+    """
+    Build adversarial overrides from script variables OR env vars.
+    Env vars take priority over script variables if set.
+    
+    Priority: ADV_SCALE > REDUCE_ADV (if both set, ADV_SCALE wins)
+    """
+    overrides = {}
+    summary_parts = []
+    
+    # Read from script variables first, then check env vars (env wins if set)
+    reduce_adv_val = REDUCE_ADV
+    adv_scale_val = ADV_SCALE
+    adv_every_val = ADV_EVERY
+    
+    # Env vars override script variables
+    env_reduce = os.environ.get("REDUCE_ADV", "").strip()
+    env_scale = os.environ.get("ADV_SCALE", "").strip()
+    env_every = os.environ.get("ADV_EVERY", "").strip()
+    
+    if env_reduce == "1":
+        reduce_adv_val = True
+    if env_scale:
+        try:
+            adv_scale_val = float(env_scale)
+        except ValueError:
+            print(f"Warning: env ADV_SCALE='{env_scale}' is not a valid float, ignoring")
+    if env_every:
+        try:
+            adv_every_val = int(env_every)
+        except ValueError:
+            print(f"Warning: env ADV_EVERY='{env_every}' is not a valid int, ignoring")
+    
+    # Determine losses.adv and losses.feat
+    adv_loss = None
+    feat_loss = None
+    scale_source = None
+    
+    # ADV_SCALE takes priority over REDUCE_ADV
+    if adv_scale_val is not None:
+        if adv_scale_val <= 0:
+            print(f"Warning: ADV_SCALE={adv_scale_val} must be positive, ignoring")
+        else:
+            adv_loss = BASE_ADV_LOSS * adv_scale_val
+            feat_loss = BASE_FEAT_LOSS * adv_scale_val
+            scale_source = f"ADV_SCALE={adv_scale_val}"
+    
+    # REDUCE_ADV only applies if ADV_SCALE wasn't used
+    if scale_source is None and reduce_adv_val:
+        adv_loss = 2.0
+        feat_loss = 2.0
+        scale_source = "REDUCE_ADV=True"
+    
+    # Apply loss overrides
+    if adv_loss is not None:
+        overrides["losses.adv"] = adv_loss
+        overrides["losses.feat"] = feat_loss
+        summary_parts.append(f"{scale_source} → losses.adv={adv_loss}, losses.feat={feat_loss}")
+    
+    # ADV_EVERY override
+    if adv_every_val is not None:
+        if adv_every_val < 1:
+            print(f"Warning: ADV_EVERY={adv_every_val} must be >= 1, ignoring")
+        else:
+            overrides["adversarial.every"] = adv_every_val
+            summary_parts.append(f"ADV_EVERY={adv_every_val} → adversarial.every={adv_every_val}")
+    
+    return overrides, summary_parts
+
+# Get adversarial overrides
+ADV_OVERRIDES, ADV_SUMMARY = get_adversarial_overrides()
+
+# Print adversarial config summary (always print to make it clear what's happening)
+print(f"\n=== Adversarial Training Config ===")
+print(f"Script vars: REDUCE_ADV={REDUCE_ADV}, ADV_SCALE={ADV_SCALE}, ADV_EVERY={ADV_EVERY}")
+print(f"Env vars:    REDUCE_ADV={os.environ.get('REDUCE_ADV', '(not set)')}, "
+      f"ADV_SCALE={os.environ.get('ADV_SCALE', '(not set)')}, "
+      f"ADV_EVERY={os.environ.get('ADV_EVERY', '(not set)')}")
+if ADV_OVERRIDES:
+    print(f"✅ OVERRIDES ACTIVE:")
+    for part in ADV_SUMMARY:
+        print(f"   {part}")
+else:
+    print(f"   (using defaults: losses.adv=4.0, losses.feat=4.0, adversarial.every=1)")
 
 print(NUM_WORKERS)
 print(CONFIG_PATH)
@@ -326,8 +446,17 @@ cmd = [
     f"mp_start_method={MP_START_METHOD}",
     f"checkpoint.save_every={CHECKPOINT_SAVE}",
 ]
+
+# ---- Inject adversarial overrides ----
+if ADV_OVERRIDES:
+    print(f"\n🎯 Injecting adversarial overrides into command:")
+    for key, value in ADV_OVERRIDES.items():
+        override_arg = f"{key}={value}"
+        cmd.append(override_arg)
+        print(f"   + {override_arg}")
+
 #f"dataset.num_samples={DATASET_NUM_SAMPLES}",
-print("Launching:", " ".join(shlex.quote(x) for x in cmd))
+print("\nLaunching:", " ".join(shlex.quote(x) for x in cmd))
 print("Dora dir:", env["AUDIOCRAFT_DORA_DIR"])
 
 # =============================================================================
