@@ -208,3 +208,4 @@ echo "[startup] Done."
 
 # For GPU monitoring, use:
 # watch -n 1 nvidia-smi
+# nvidia-smi topo -m

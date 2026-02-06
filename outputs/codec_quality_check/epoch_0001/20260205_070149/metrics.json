@@ -1,0 +1,69 @@
+{
+  "timestamp": "20260205_070149",
+  "checkpoint": "/root/workspace/experiments/audiocraft/xps/8960a484/checkpoint.th",
+  "num_samples": 5,
+  "segment_duration": 10.0,
+  "sample_rate": 32000,
+  "num_codebooks": 4,
+  "average_metrics": {
+    "l1": 0.08806400150060653,
+    "mse": 0.02508316431194544,
+    "sisnr_standard": 1.9472890347242355,
+    "sisnr_audiocraft": -1.9472890347242355,
+    "mel": 1.203218972682953,
+    "msspec": 0.5612881337602933
+  },
+  "per_sample_metrics": [
+    {
+      "sample_idx": 0,
+      "source_path": "/root/workspace/data/all_data/egs/valid/mtg__1251449.low_00001.wav",
+      "l1": 0.20289120078086853,
+      "mse": 0.07466207444667816,
+      "sisnr_standard": 0.4035484045743942,
+      "sisnr_audiocraft": -0.4035484045743942,
+      "mel": 0.9362759590148926,
+      "msspec": 1.4270018736521404
+    },
+    {
+      "sample_idx": 1,
+      "source_path": "/root/workspace/data/all_data/egs/valid/mtg__1150354.low_00000.wav",
+      "l1": 0.023106765002012253,
+      "mse": 0.0017421585507690907,
+      "sisnr_standard": -1.5712785720825195,
+      "sisnr_audiocraft": 1.5712785720825195,
+      "mel": 1.8695836067199707,
+      "msspec": 0.08108405023813248
+    },
+    {
+      "sample_idx": 2,
+      "source_path": "/root/workspace/data/all_data/egs/valid/mtg__22154.low_00001.wav",
+      "l1": 0.07036136835813522,
+      "mse": 0.009046919643878937,
+      "sisnr_standard": 11.087945699691772,
+      "sisnr_audiocraft": -11.087945699691772,
+      "mel": 1.075402021408081,
+      "msspec": 0.40610018372535706
+    },
+    {
+      "sample_idx": 3,
+      "source_path": "/root/workspace/data/all_data/egs/valid/mtg__1061336.low_00001.wav",
+      "l1": 0.04419867321848869,
+      "mse": 0.0035334755666553974,
+      "sisnr_standard": 3.8217884302139282,
+      "sisnr_audiocraft": -3.8217884302139282,
+      "mel": 0.802126944065094,
+      "msspec": 0.30065955718358356
+    },
+    {
+      "sample_idx": 4,
+      "source_path": "/root/workspace/data/all_data/egs/valid/mtg__23172.low_00010.wav",
+      "l1": 0.09976200014352798,
+      "mse": 0.036431193351745605,
+      "sisnr_standard": -4.005558788776398,
+      "sisnr_audiocraft": 4.005558788776398,
+      "mel": 1.332706332206726,
+      "msspec": 0.5915950040022532
+    }
+  ],
+  "note": "AudioCraft uses SIGN-INVERTED SI-SNR! sisnr_audiocraft is what training logs show."
+}

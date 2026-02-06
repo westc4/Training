@@ -14,12 +14,17 @@ This repository provides Jupyter notebooks and scripts for training neural audio
 - **Flexible Configuration**: Hydra-based configs for easy experimentation
 - **GPU Optimized**: Designed for high-VRAM GPUs (96GB+)
 - **Dora Integration**: Experiment tracking and management with Dora
+- **Training Quality Checks**: Automated codec quality verification, stability monitoring, and sample generation
+- **Curriculum Learning**: Progressive training from short to long sequences
 
 ## Repository Structure
 
 ```
 Training/
 ├── notebooks/
+│   ├── dora_train.py           # Compression model training with preflight checks
+│   ├── musicgen_train.py       # MusicGen LM training script
+│   ├── musicgen_generate.py    # Sample generation from trained models
 │   └── fma/
 │       ├── small/              # FMA-small dataset workflows
 │       │   ├── 01_fma_small_mini_setup.ipynb
@@ -31,11 +36,23 @@ Training/
 │           ├── 01_fma_large_setup.ipynb
 │           ├── 01b_fma_large_downloader.ipynb
 │           └── 02_audiocraft_train_compression_debug.ipynb
+├── training_checks/            # Training validation and monitoring tools
+│   ├── preflight.py            # Pre-training validation checks
+│   ├── codec_quality_check.py  # Codec reconstruction quality verification
+│   ├── validate_conditioning.py # Conditioning pipeline validation
+│   ├── stability_monitor.py    # INF/NaN gradient monitoring
+│   ├── curriculum_train.py     # Progressive sequence length training
+│   ├── fixed_seed_sampler.py   # Reproducible sample generation for A/B testing
+│   └── curriculum_configs/     # YAML configs for curriculum stages
+│       ├── short_10s.yaml
+│       └── medium_20s.yaml
 ├── model_config/
 │   ├── fma_small_mini.yaml     # Config for small dataset
 │   └── fma_large.yaml          # Config for large dataset
 ├── outputs/
 │   ├── Checkpoints Small/      # Training checkpoints
+│   ├── codec_quality_check/    # Codec verification outputs
+│   ├── samples/                # Generated sample comparisons
 │   └── musicgen_uncond_debug/  # MusicGen outputs
 ├── scripts/
 │   ├── download_script.sh      # Dataset download automation
@@ -50,10 +67,11 @@ Training/
 ### Prerequisites
 
 - RunPod instance (or similar) with:
-  - NVIDIA GPU with ≥ 24GB VRAM (96GB recommended)
-  - CUDA support
+  - NVIDIA GPU with ≥ 24GB VRAM (A40)
+  - Preffered GPU: 4X H200 SXM
+  - Base Image: pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
   - Python 3.11
-  - At least 100GB free disk space
+  - At least 2TB free disk space
 
 ### Installation & Setup
 
@@ -157,6 +175,97 @@ Default hyperparameters (configurable in notebooks):
 - **Training epochs**: 1 (debug mode)
 - **Workers**: Auto-detected (CPU cores / 4)
 
+## Training Quality Checks
+
+The `training_checks/` folder contains tools for monitoring and validating training quality.
+
+### Codec Quality Check
+
+Verifies codec (EnCodec) reconstruction quality by encoding and decoding audio samples.
+
+```bash
+# Run standalone
+python training_checks/codec_quality_check.py --num-samples 10
+
+# With specific checkpoint
+python training_checks/codec_quality_check.py --checkpoint /path/to/checkpoint.th
+```
+
+**Integrated mode**: Configure in `dora_train.py`:
+```python
+CODEC_CHECK_EVERY = 10     # Run every 10 epochs (0=disabled)
+CODEC_CHECK_SAMPLES = 5    # Number of samples per check
+```
+
+**Output includes**:
+- SI-SNR metrics (standard and AudioCraft conventions)
+- L1, MSE, mel spectrogram losses
+- Original/reconstructed wav pairs for listening tests
+
+### Conditioning Validation
+
+Validates that text conditioning is properly configured for text-to-music training.
+
+```bash
+python training_checks/validate_conditioning.py --num-samples 100
+```
+
+**Checks**:
+- Percentage of samples with text descriptions
+- Average description token length
+- Conditioner configuration (warns if unconditional)
+
+### Stability Monitor
+
+Tracks gradient instability during training (can be imported into training scripts).
+
+```python
+from training_checks.stability_monitor import StabilityMonitor, StabilityConfig
+
+monitor = StabilityMonitor(StabilityConfig(
+    max_nan_ratio_per_epoch=0.1,      # Fail if >10% NaN losses
+    max_inf_grad_ratio_per_epoch=0.3, # Warn if >30% INF gradients
+    enable_adaptive_lr=True,          # Auto-reduce LR on instability
+))
+```
+
+### Curriculum Training
+
+Progressive training from short to long sequences for better convergence.
+
+```bash
+# Auto-detect current stage and continue
+python training_checks/curriculum_train.py --auto --dry-run
+
+# Run specific stage
+python training_checks/curriculum_train.py --stage short_10s
+python training_checks/curriculum_train.py --stage medium_20s --continue-from /path/to/checkpoint.th
+```
+
+**Stages**:
+| Stage | Segment | Batch Size | Epochs | Purpose |
+|-------|---------|------------|--------|--------|
+| `short_10s` | 10s | 128 | 50 | Fast initial learning |
+| `medium_20s` | 20s | 64 | 50 | Structure learning |
+| `full_30s` | 30s | 32 | 100 | Long-form coherence |
+
+### Fixed-Seed Sample Generation
+
+Generates samples with fixed seeds for reproducible A/B comparison across epochs.
+
+```bash
+# Generate samples for current checkpoint
+python training_checks/fixed_seed_sampler.py --epoch 50
+
+# List available checkpoints
+python training_checks/fixed_seed_sampler.py --list-epochs
+
+# Generate HTML comparison index only
+python training_checks/fixed_seed_sampler.py --generate-index
+```
+
+**Output**: HTML index at `outputs/samples/index.html` with side-by-side audio players.
+
 ## Utilities
 
 - **SSH Sync**: `runpod_ssh_sync.py` - Syncs SSH config for RunPod
@@ -225,4 +334,4 @@ If you use this training pipeline, please cite the original AudioCraft paper:
 
 ---
 
-**Status**: Active development | Last updated: January 2026
+**Status**: Active development | Last updated: February 2026
