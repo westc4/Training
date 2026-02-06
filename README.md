@@ -67,10 +67,11 @@ Training/
 ### Prerequisites
 
 - RunPod instance (or similar) with:
-  - NVIDIA GPU with ≥ 24GB VRAM (96GB recommended)
-  - CUDA support
+  - NVIDIA GPU with ≥ 24GB VRAM (A40)
+  - Preffered GPU: 4X H200 SXM
+  - Base Image: pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
   - Python 3.11
-  - At least 100GB free disk space
+  - At least 2TB free disk space
 
 ### Installation & Setup
 
