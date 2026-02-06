@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export ACCOUNT_ID="6c8acbda921889bbaf880ae4bdbf99f0"   # or export it outside
-export AWS_ACCESS_KEY_ID="38633d51c6288fe36b6e26faee0b7350"        # or export it outside
-export AWS_SECRET_ACCESS_KEY="206ba17204b3d6f04610e189e05f54848ef0e50013181c5b132cd9e1174878ed"  # or export it outside
+export ACCOUNT_ID=""   # or export it outside
+export AWS_ACCESS_KEY_ID=""        # or export it outside
+export AWS_SECRET_ACCESS_KEY=""  # or export it outside
 
 BUCKET="music-train"
 
