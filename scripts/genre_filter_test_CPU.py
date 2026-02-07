@@ -21,20 +21,152 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # Now import everything else
+import argparse
+import hashlib
 import json
+import logging
 import platform
 import subprocess
 import threading
 import time
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from tqdm import tqdm
 
 import numpy as np
 import essentia
 import essentia.standard as es
+
+# ============================================================================
+# LOGGING
+# ============================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("genre_filter")
+
+# ============================================================================
+# FROZEN TAXONOMIES  (Option 1 – dense slider vectors)
+# ============================================================================
+# Derived from MTG-Jamendo model label files.  See schema note above for safe
+# modification procedure.
+
+TAXONOMY_VERSION = "1.0.0"
+
+GENRE_TAXONOMY: List[str] = [
+    "60s", "70s", "80s", "90s", "acidjazz", "alternative", "alternativerock",
+    "ambient", "atmospheric", "blues", "bluesrock", "bossanova", "breakbeat",
+    "celtic", "chanson", "chillout", "choir", "classical", "classicrock", "club",
+    "contemporary", "country", "dance", "darkambient", "darkwave", "deephouse",
+    "disco", "downtempo", "drumnbass", "dub", "dubstep", "easylistening",
+    "edm", "electro", "electronic", "electronica", "electropop", "ethno",
+    "eurodance", "experimental", "folk", "funk", "fusion", "gospel",
+    "gothicrock", "grunge", "hardrock", "hardtechno", "hiphop", "house",
+    "idm", "improvisation", "indie", "industrial", "instrumentalpop",
+    "instrumentalrock", "jazz", "jazzfusion", "latin", "lounge", "medieval",
+    "metal", "minimal", "newage", "newwave", "noise", "orchestral", "pop",
+    "popfolk", "poprock", "postpunk", "postrock", "progressive", "psychedelic",
+    "punkrock", "rap", "reggae", "rnb", "rock", "rocknroll", "romantic",
+    "singersongwriter", "ska", "soul", "soundtrack", "swing", "symphonic",
+    "synthpop", "techno", "trance", "triphop", "world",
+]  # 87 tags – APPEND-ONLY
+
+MOOD_TAXONOMY: List[str] = [
+    "action", "adventure", "advertising", "background", "ballad", "calm",
+    "children", "christmas", "commercial", "cool", "corporate", "dark",
+    "deep", "documentary", "drama", "dramatic", "dream", "emotional",
+    "energetic", "epic", "fast", "film", "fun", "funny", "game", "groovy",
+    "happy", "heavy", "holiday", "hopeful", "inspiring", "love",
+    "meditative", "melancholic", "melodic", "motivational", "movie",
+    "nature", "party", "positive", "powerful", "relaxing", "retro",
+    "romantic", "sad", "sexy", "slow", "soft", "soundscape", "space",
+    "sport", "summer", "trailer", "travel", "upbeat", "uplifting",
+]  # 56 tags – APPEND-ONLY
+
+INSTRUMENT_TAXONOMY: List[str] = [
+    "accordion", "acousticbassguitar", "acousticguitar", "bass", "beat",
+    "bell", "bongo", "brass", "cello", "clarinet", "classicalguitar",
+    "computer", "doublebass", "drummachine", "drums", "electricguitar",
+    "electricpiano", "flute", "guitar", "harmonica", "harp", "horn",
+    "keyboard", "oboe", "orchestra", "organ", "pad", "percussion", "piano",
+    "pipeorgan", "Rhodes", "sampler", "saxophone", "strings", "synthesizer",
+    "trombone", "trumpet", "viola", "violin", "voice",
+]  # 40 tags – APPEND-ONLY
+
+
+# ============================================================================
+# DENSE-VECTOR & VALIDATION HELPERS
+# ============================================================================
+
+def _clamp_probability(v: float) -> float:
+    """Clamp a value to [0.0, 1.0]."""
+    return max(0.0, min(1.0, float(v)))
+
+
+def _to_dense(sparse_pairs: List[Tuple[str, float]],
+              taxonomy: List[str]) -> Dict[str, float]:
+    """
+    Convert a sparse list of (tag, score) into a dense dict covering every
+    tag in *taxonomy* (missing tags → 0.0, scores clamped to [0,1]).
+    """
+    lookup = {tag: _clamp_probability(score) for tag, score in sparse_pairs}
+    return {tag: lookup.get(tag, 0.0) for tag in taxonomy}
+
+
+def _topk_from_dense(dense: Dict[str, float], k: int = 5) -> List[Dict[str, Any]]:
+    """
+    Return the top-*k* entries from a dense dict, sorted descending by
+    score then alphabetically by tag (for deterministic ordering).
+    """
+    ranked = sorted(dense.items(), key=lambda t: (-t[1], t[0]))
+    return [{"tag": tag, "score": round(score, 6)} for tag, score in ranked[:k]]
+
+
+def _file_sha256(path: str) -> str:
+    """Return hex SHA-256 of file bytes."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _taxonomy_hash() -> str:
+    """Deterministic fingerprint of the three taxonomy lists."""
+    blob = json.dumps(
+        [GENRE_TAXONOMY, MOOD_TAXONOMY, INSTRUMENT_TAXONOMY], sort_keys=False
+    ).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _build_provenance(
+    model_paths: Dict[str, Optional[str]],
+) -> Dict[str, Any]:
+    """Build the provenance sub-dict for a result record."""
+    return {
+        "extractor": "essentia+custom",
+        "extractor_version": essentia.__version__,
+        "model_names": {
+            k: Path(v).name if v else None
+            for k, v in model_paths.items()
+        },
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "taxonomy_version": TAXONOMY_VERSION,
+        "taxonomy_hash": _taxonomy_hash(),
+    }
+
+
+def _ensure_python_float(v) -> float:
+    """Safely cast any numeric (numpy or Python) to plain float."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # ============================================================================
@@ -42,11 +174,11 @@ import essentia.standard as es
 # ============================================================================
 
 # Processing limits
-MAX_FILES_TO_PROCESS = 100  # Maximum number of audio files to process (set to None for all files)
+MAX_FILES_TO_PROCESS = 1000  # Maximum number of audio files to process (set to None for all files)
 
 # Parallel processing settings
 ENABLE_PARALLEL_PROCESSING = True  # Enable/disable parallel processing
-MAX_WORKERS = 32  # Number of parallel workers (recommended: 2-8 for CPU, 1-2 for GPU)
+MAX_WORKERS = 64  # Number of parallel workers (recommended: 2-8 for CPU, 1-2 for GPU)
                  # NOTE: Using ProcessPoolExecutor - each worker is a separate process
                  # with its own RAM space, ensuring true parallel processing
 
@@ -570,8 +702,8 @@ def detect_bpm_essentia(path: str, sr: int = 44100):
     # trimmer = es.StartStopSilence()
     # audio = trimmer(audio)
 
-    # Rhythm extraction
-    rhythm = es.RhythmExtractor2013(method="multifeature")
+    # Rhythm extraction – degara is ~3x faster than multifeature
+    rhythm = es.RhythmExtractor2013(method="degara")
     bpm, beats, beat_conf, _, _ = rhythm(audio)
 
     # beat_conf can be a single float or array; handle both cases
@@ -605,25 +737,8 @@ def detect_genre_essentia(
     NOTE: Using mock data as installed Essentia lacks TensorflowPredictEffnetDiscogs.
     Install essentia 2.1b6+ with TensorFlow support for actual inference.
     """
-    # Load labels
-    with open(labels_json, "r") as f:
-        labels_obj = json.load(f)
-
-    if isinstance(labels_obj, dict) and "classes" in labels_obj:
-        labels = labels_obj["classes"]
-    elif isinstance(labels_obj, list):
-        labels = labels_obj
-    else:
-        raise RuntimeError("labels_json must have 'classes' key or be a list")
-
-    # Return mock predictions (uniform distribution)
-    # TODO: Replace with actual TensorFlow inference when Essentia is updated
-    num_classes = len(labels)
-    mock_scores = np.random.dirichlet(np.ones(num_classes) * 0.5)
-    
-    # Top-k
-    idx = np.argsort(-mock_scores)[:topk]
-    return [(str(labels[i]), float(mock_scores[i])) for i in idx]
+    # Use cached labels for speed (falls back to disk read if not cached)
+    return _mock_classifier_prediction_cached(labels_json, topk)
 
 
 def detect_mood_theme_essentia(
@@ -638,7 +753,7 @@ def detect_mood_theme_essentia(
     Mood/theme inference using mock data (Essentia predictor unavailable).
     Returns list of (mood_tag, score) sorted desc.
     """
-    return _mock_classifier_prediction(labels_json, topk)
+    return _mock_classifier_prediction_cached(labels_json, topk)
 
 
 def detect_instruments_essentia(
@@ -653,7 +768,7 @@ def detect_instruments_essentia(
     Instrument inference using mock data (Essentia predictor unavailable).
     Returns list of (instrument, score) sorted desc.
     """
-    return _mock_classifier_prediction(labels_json, topk)
+    return _mock_classifier_prediction_cached(labels_json, topk)
 
 
 def detect_genre_discogs519(
@@ -668,7 +783,7 @@ def detect_genre_discogs519(
     Genre (519 classes) inference using mock data (Essentia predictor unavailable).
     Returns list of (genre, score) sorted desc.
     """
-    return _mock_classifier_prediction(labels_json, topk)
+    return _mock_classifier_prediction_cached(labels_json, topk)
 
 
 def detect_approachability_engagement(
@@ -988,22 +1103,19 @@ def comprehensive_audio_analysis(
     - Tonality: tonal vs atonal classification
     """
     # =========================================================================
-    # OPTIMIZED: Load audio ONCE per sample rate
+    # OPTIMIZED: Load audio ONCE at 44.1kHz only (16kHz removed – embeddings disabled)
     # =========================================================================
     audio_44k = es.MonoLoader(filename=path, sampleRate=44100)()
-    audio_16k = es.MonoLoader(filename=path, sampleRate=16000)()
     
     # =========================================================================
     # EMBEDDINGS: Disabled (Essentia TensorFlow predictors unavailable)
     # =========================================================================
-    # embedding_model = model_cache.get_effnet_discogs(str(Path(embedding_model_pb).expanduser()))
-    # effnet_embeddings = embedding_model(audio_16k)
     effnet_embeddings = None  # Not used with mock predictions
     
     # =========================================================================
-    # BPM Detection (uses 44kHz audio)
+    # BPM Detection (uses 44kHz audio) – degara method is ~3x faster
     # =========================================================================
-    rhythm = es.RhythmExtractor2013(method="multifeature")
+    rhythm = es.RhythmExtractor2013(method="degara")
     bpm, beats, beat_conf, _, beats_loudness = rhythm(audio_44k)
     
     if isinstance(beat_conf, (list, np.ndarray)):
@@ -1041,28 +1153,41 @@ def comprehensive_audio_analysis(
     rms = np.sqrt(np.mean(audio_44k**2))
     loudness_integrated = 20 * np.log10(rms) if rms > 0 else -96
     
+    # Vectorised loudness-range computation using zero-copy strided views
     frame_size = int(44100 * 0.4)
     hop_size = frame_size // 2
-    frame_loudnesses = []
-    for i in range(0, len(audio_44k) - frame_size, hop_size):
-        frame = audio_44k[i:i+frame_size]
-        frame_rms = np.sqrt(np.mean(frame**2))
-        if frame_rms > 0:
-            frame_loudnesses.append(20 * np.log10(frame_rms))
-    
-    loudness_range = np.percentile(frame_loudnesses, 95) - np.percentile(frame_loudnesses, 10) if frame_loudnesses else 0.0
+    n_samples = len(audio_44k)
+    n_frames_lr = max(0, (n_samples - frame_size) // hop_size + 1)
+    if n_frames_lr > 0:
+        # sliding_window_view gives a zero-copy view (no huge temp array)
+        windowed = np.lib.stride_tricks.sliding_window_view(audio_44k, frame_size)[::hop_size]
+        frame_rms = np.sqrt(np.mean(windowed ** 2, axis=1))
+        valid = frame_rms > 0
+        if np.any(valid):
+            frame_loudnesses_arr = 20 * np.log10(frame_rms[valid])
+            loudness_range = float(np.percentile(frame_loudnesses_arr, 95) - np.percentile(frame_loudnesses_arr, 10))
+        else:
+            loudness_range = 0.0
+    else:
+        loudness_range = 0.0
     
     peak = np.max(np.abs(audio_44k))
     peak_dbfs = 20 * np.log10(peak) if peak > 0 else -np.inf
     crest_factor = peak / rms if rms > 0 else 0
     dynamic_range_db = 20 * np.log10(crest_factor) if crest_factor > 0 else 0
     
-    # Silence ratio
+    # Silence ratio – single pass, vectorised with reshape (no copy)
     silence_threshold = 1e-4
-    frame_gen = es.FrameGenerator(audio_44k, frameSize=2048, hopSize=1024)
-    silent_frames = sum(1 for frame in frame_gen if np.sqrt(np.mean(frame**2)) < silence_threshold)
-    frame_gen = es.FrameGenerator(audio_44k, frameSize=2048, hopSize=1024)
-    total_frames = sum(1 for _ in frame_gen)
+    sr_frame = 2048
+    n_full_frames = n_samples // sr_frame
+    if n_full_frames > 0:
+        reshaped = audio_44k[:n_full_frames * sr_frame].reshape(n_full_frames, sr_frame)
+        sr_rms = np.sqrt(np.mean(reshaped ** 2, axis=1))
+        silent_frames = int(np.sum(sr_rms < silence_threshold))
+        total_frames = n_full_frames
+    else:
+        silent_frames = 0
+        total_frames = 0
     silence_ratio = silent_frames / total_frames if total_frames > 0 else 0.0
     
     audio_quality = {
@@ -1536,96 +1661,121 @@ def comprehensive_audio_analysis(
     best_club_scene = sorted_scenes[0][0]
     best_club_scene_score = sorted_scenes[0][1]
 
+    # =========================================================================
+    # BUILD DENSE VECTORS
+    # =========================================================================
+    genre_dense  = _to_dense(genre_results,      GENRE_TAXONOMY)
+    mood_dense   = _to_dense(mood_results,        MOOD_TAXONOMY)
+    instr_dense  = _to_dense(instrument_results,  INSTRUMENT_TAXONOMY)
+
+    genre_topk  = _topk_from_dense(genre_dense,  k=5)
+    mood_topk   = _topk_from_dense(mood_dense,   k=10)
+    instr_topk  = _topk_from_dense(instr_dense,  k=10)
+
+    # SHA-256 stable track id
+    track_id = _file_sha256(path)
+
+    # =========================================================================
+    # ASSEMBLE CANONICAL OUTPUT
+    # =========================================================================
     result = {
-        # BPM (fixed confidence normalization)
-        "bpm": bpm,
-        "bpm_conf_raw": bpm_conf_raw,
-        "bpm_conf_norm": bpm_conf_norm,
-        "bpm_is_reliable": bpm_is_reliable,
+        "track_id": track_id,
+        "path": str(path),  # will be overwritten to relative in worker
+        "duration_sec": _ensure_python_float(tech_metadata.get("duration_sec", duration)),
 
-        # Musical Structure
-        "key": musical_structure["key"],
-        "mode": musical_structure["mode"],
-        "key_confidence": musical_structure["key_confidence"],
-        "meter": musical_structure["meter"],
-        "danceability": musical_structure["danceability"],
-        "onset_rate": musical_structure["onset_rate"],
+        "conditioning": {
+            # -- rhythm --
+            "bpm":             _ensure_python_float(bpm),
+            "bpm_conf":        _ensure_python_float(bpm_conf_norm),
+            "bpm_is_reliable": bool(bpm_is_reliable),
 
-        # Genre/Style
-        "genre_top1": genre_results[0][0] if genre_results else "unknown",
-        "genre_topk": genre_results,
+            # -- tonal --
+            "key":             musical_structure["key"],
+            "mode":            musical_structure["mode"],
+            "key_confidence":  _ensure_python_float(musical_structure["key_confidence"]),
+            "meter":           musical_structure["meter"],
 
-        # Mood/Vibe
-        "mood_tags": mood_results,
-        "mood_tags_dict": {tag: score for tag, score in mood_results},
-        "energy_level": energy_level,
-        "energy_value": float(energy_value),
-        "valence": float(valence),
-        "arousal": float(arousal),
+            # -- vocal --
+            "has_vocals":      bool(has_vocals),
+            "vocal_score":     _ensure_python_float(voice_score),
+            "vocal_type":      vocal_type,
 
-        # Overall Scores
-        "clubbiness": float(clubbiness),
-        "clubbiness_category": clubbiness_category,
+            # -- continuous sliders --
+            "energy_value":    _ensure_python_float(energy_value),
+            "valence":         _ensure_python_float(valence),
+            "arousal":         _ensure_python_float(arousal),
+            "clubbiness":      _ensure_python_float(clubbiness),
+            "acoustic_vs_electronic": _ensure_python_float(acoustic_vs_electronic),
+            "onset_rate":      _ensure_python_float(musical_structure["onset_rate"]),
+            "danceability_raw": _ensure_python_float(musical_structure["danceability"]),
 
-        # Sub-Club Scores (genre-specific club scenes)
-        "club_edm": float(club_edm),
-        "club_hiphop": float(club_hiphop),
-        "club_latin": float(club_latin),
-        "club_rock": float(club_rock),
-        "club_pop": float(club_pop),
-        "club_reggae": float(club_reggae),
-        "best_club_scene": best_club_scene,
-        "best_club_scene_score": float(best_club_scene_score),
+            # -- dense taxonomy vectors --
+            "genre_scores_dense":  genre_dense,
+            "mood_scores_dense":   mood_dense,
+            "instrument_scores":   instr_dense,
 
-        # Instrumentation
-        "primary_instruments": instrument_results,
-        "acoustic_vs_electronic": float(acoustic_vs_electronic),
+            # -- top-k summaries --
+            "genre_topk":      genre_topk,
+            "mood_topk":       mood_topk,
+            "instrument_topk": instr_topk,
 
-        # Vocals
-        "has_vocals": has_vocals,
-        "vocal_score": float(voice_score),
-        "vocal_type": vocal_type,
-        "instrumental": instrumental,
+            # -- club sub-scores --
+            "club_edm":        _ensure_python_float(club_edm),
+            "club_hiphop":     _ensure_python_float(club_hiphop),
+            "club_latin":      _ensure_python_float(club_latin),
+            "club_rock":       _ensure_python_float(club_rock),
+            "club_pop":        _ensure_python_float(club_pop),
+            "club_reggae":     _ensure_python_float(club_reggae),
+            "best_club_scene": best_club_scene,
+            "best_club_scene_score": _ensure_python_float(best_club_scene_score),
+        },
 
-        # Audio Quality
-        "lufs_integrated": audio_quality["lufs_integrated"],
-        "loudness_range": audio_quality["loudness_range"],
-        "peak_dbfs": audio_quality["peak_dbfs"],
-        "dynamic_range_db": audio_quality["dynamic_range_db"],
-        "crest_factor": audio_quality["crest_factor"],
-        "silence_ratio": audio_quality["silence_ratio"],
-        "is_clipped": audio_quality["is_clipped"],
-        "is_too_quiet": audio_quality["is_too_quiet"],
+        "audio_stats": audio_quality,
 
-        # Technical Metadata
-        "duration_sec": tech_metadata["duration_sec"],
-        "sample_rate_hz": tech_metadata["sample_rate_hz"],
-        "channels": tech_metadata["channels"],
-        "bitrate_kbps": tech_metadata["bitrate_kbps"],
-        "codec_name": tech_metadata["codec_name"],
-        "container": tech_metadata["container"],
-        "source_format": tech_metadata["source_format"],
+        "file": {
+            "sample_rate_hz":  tech_metadata.get("sample_rate_hz"),
+            "channels":        tech_metadata.get("channels"),
+            "bitrate_kbps":    tech_metadata.get("bitrate_kbps"),
+            "codec_name":      tech_metadata.get("codec_name"),
+            "container":       tech_metadata.get("container"),
+            "source_format":   tech_metadata.get("source_format"),
+        },
+
+        "provenance": _build_provenance({
+            "embedding_model":     embedding_model_pb,
+            "genre_model":         genre_model_pb,
+            "genre_labels":        genre_labels_json,
+            "mood_model":          mood_model_pb,
+            "mood_labels":         mood_labels_json,
+            "instrument_model":    instrument_model_pb,
+            "instrument_labels":   instrument_labels_json,
+            "approachability_model": approachability_model_pb,
+            "engagement_model":    engagement_model_pb,
+            "aggressive_model":    aggressive_model_pb,
+            "happy_model":         happy_model_pb,
+            "party_model":         party_model_pb,
+            "relaxed_model":       relaxed_model_pb,
+            "sad_model":           sad_model_pb,
+            "tonal_atonal_model":  tonal_atonal_model_pb,
+        }),
     }
 
-    # Add new model results if available
-    if genre_discogs519_results is not None:
-        result["genre_discogs519_top1"] = genre_discogs519_results[0][0] if genre_discogs519_results else "unknown"
-        result["genre_discogs519_topk"] = genre_discogs519_results
+    # -- optional models (append into conditioning) --
+    cond = result["conditioning"]
 
     if approachability_engagement is not None:
-        result["approachability"] = approachability_engagement["approachability"]
-        result["engagement"] = approachability_engagement["engagement"]
+        cond["approachability"] = _ensure_python_float(approachability_engagement["approachability"])
+        cond["engagement"]      = _ensure_python_float(approachability_engagement["engagement"])
 
     if mood_emotions is not None:
-        result["mood_aggressive"] = mood_emotions["aggressive"]
-        result["mood_happy"] = mood_emotions["happy"]
-        result["mood_party"] = mood_emotions["party"]
-        result["mood_relaxed"] = mood_emotions["relaxed"]
-        result["mood_sad"] = mood_emotions["sad"]
+        cond["mood_aggressive"] = _ensure_python_float(mood_emotions["aggressive"])
+        cond["mood_happy"]      = _ensure_python_float(mood_emotions["happy"])
+        cond["mood_party"]      = _ensure_python_float(mood_emotions["party"])
+        cond["mood_relaxed"]    = _ensure_python_float(mood_emotions["relaxed"])
+        cond["mood_sad"]        = _ensure_python_float(mood_emotions["sad"])
 
     if tonality is not None:
-        result["tonal_score"] = tonality["tonal_score"]
-        result["is_tonal"] = tonality["is_tonal"]
+        cond["tonal_score"] = _ensure_python_float(tonality["tonal_score"])
 
     return result
 
@@ -1634,18 +1784,53 @@ def comprehensive_audio_analysis(
 # MULTIPROCESSING WORKER FUNCTION (must be at module level for pickling)
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# Module-level label cache populated once before forking workers.
+# Workers inherit it via copy-on-write (fork).  This avoids re-reading
+# JSON files from disk on every call to _mock_classifier_prediction.
+# ---------------------------------------------------------------------------
+_LABEL_CACHE: Dict[str, List[str]] = {}
+
+
+def _populate_label_cache(json_paths: List[str]) -> None:
+    """Read all label JSON files once into _LABEL_CACHE."""
+    global _LABEL_CACHE
+    for p in json_paths:
+        if p and p not in _LABEL_CACHE:
+            with open(p, "r") as f:
+                obj = json.load(f)
+            labels = obj["classes"] if isinstance(obj, dict) and "classes" in obj else obj
+            _LABEL_CACHE[p] = labels
+
+
+def _mock_classifier_prediction_cached(labels_json: str, topk: int = 5):
+    """Like _mock_classifier_prediction but uses the pre-populated cache."""
+    labels = _LABEL_CACHE.get(labels_json)
+    if labels is None:
+        # Fallback: read from disk
+        with open(labels_json, "r") as f:
+            obj = json.load(f)
+        labels = obj["classes"] if isinstance(obj, dict) and "classes" in obj else obj
+    num_classes = len(labels)
+    mock_scores = np.random.dirichlet(np.ones(num_classes) * 0.5)
+    idx = np.argsort(-mock_scores)[:topk]
+    return [(str(labels[i]), float(mock_scores[i])) for i in idx]
+
+
 def _process_file_worker(args_tuple) -> Optional[Dict]:
     """
-    Worker function for multiprocessing. Recreates ModelCache in each process.
-    This ensures each process has its own memory space.
+    Worker function for multiprocessing.
+    When using 'fork' start method, inherits model cache and label cache
+    from the parent process via copy-on-write.
     
     Args:
-        args_tuple: (test_file, model_paths_dict, track_metadata_dict)
+        args_tuple: (test_file, model_paths_dict, track_metadata_dict, base_dir)
     """
-    test_file, model_paths, track_metadata = args_tuple
+    test_file, model_paths, track_metadata, base_dir = args_tuple
     
     try:
-        # Create new ModelCache for this process
+        # With fork, the parent's ModelCache is inherited (CoW).
+        # Create a lightweight one only if needed (e.g. spawn fallback).
         model_cache = ModelCache()
         
         with SuppressStderr():
@@ -1670,8 +1855,9 @@ def _process_file_worker(args_tuple) -> Optional[Dict]:
                 tonal_atonal_model_pb=model_paths.get('tonal_atonal_model'),
             )
         
-        # Add filename and track metadata
+        # Add filename, path, and track metadata
         results["filename"] = Path(test_file).name
+        results["path"] = str(Path(test_file).relative_to(base_dir)) if base_dir else str(test_file)
         test_filename = Path(test_file).name
         file_metadata = track_metadata.get(test_filename, {})
         results["track_metadata"] = file_metadata if file_metadata else None
@@ -1688,10 +1874,85 @@ def _process_file_worker(args_tuple) -> Optional[Dict]:
         return None
 
 
+# ============================================================================
+# SELF-TEST
+# ============================================================================
+
+def _run_self_test(
+    models_dir: str,
+    downloads_dir: str,
+) -> bool:
+    """Quick smoke test: process ≤3 files, print JSON, validate schema."""
+    import glob as _glob
+
+    files = sorted(_glob.glob(f"{downloads_dir}/*.mp3"))[:3]
+    if not files:
+        print("Self-test: no MP3 files found – SKIP")
+        return True
+
+    mc = ModelCache()
+    _populate_label_cache([
+        f"{models_dir}/mtg_jamendo_genre-discogs-effnet-1.json",
+        f"{models_dir}/mtg_jamendo_moodtheme-discogs-effnet-1.json",
+        f"{models_dir}/mtg_jamendo_instrument-discogs-effnet-1.json",
+        f"{models_dir}/genre_discogs519-discogs-maest-30s-pw-519l-1.json",
+    ])
+
+    ok = True
+    for p in files:
+        result = comprehensive_audio_analysis(
+            path=p,
+            embedding_model_pb=f"{models_dir}/discogs-effnet-bs64-1.pb",
+            genre_model_pb=f"{models_dir}/mtg_jamendo_genre-discogs-effnet-1.pb",
+            genre_labels_json=f"{models_dir}/mtg_jamendo_genre-discogs-effnet-1.json",
+            mood_model_pb=f"{models_dir}/mtg_jamendo_moodtheme-discogs-effnet-1.pb",
+            mood_labels_json=f"{models_dir}/mtg_jamendo_moodtheme-discogs-effnet-1.json",
+            instrument_model_pb=f"{models_dir}/mtg_jamendo_instrument-discogs-effnet-1.pb",
+            instrument_labels_json=f"{models_dir}/mtg_jamendo_instrument-discogs-effnet-1.json",
+            model_cache=mc,
+            approachability_model_pb=f"{models_dir}/approachability_regression-discogs-effnet-1.pb",
+            engagement_model_pb=f"{models_dir}/engagement_regression-discogs-effnet-1.pb",
+            aggressive_model_pb=f"{models_dir}/mood_aggressive-discogs-effnet-1.pb",
+            happy_model_pb=f"{models_dir}/mood_happy-discogs-effnet-1.pb",
+            party_model_pb=f"{models_dir}/mood_party-discogs-effnet-1.pb",
+            relaxed_model_pb=f"{models_dir}/mood_relaxed-discogs-effnet-1.pb",
+            sad_model_pb=f"{models_dir}/mood_sad-discogs-effnet-1.pb",
+            tonal_atonal_model_pb=f"{models_dir}/tonal_atonal-discogs-effnet-1.pb",
+        )
+        print(json.dumps(result, indent=2, default=str))
+
+        # Validate dense vector lengths
+        cond = result.get("conditioning", result)  # handle both schemas
+        checks = [
+            ("genre_scores_dense", len(GENRE_TAXONOMY)),
+            ("mood_scores_dense", len(MOOD_TAXONOMY)),
+            ("instrument_scores", len(INSTRUMENT_TAXONOMY)),
+        ]
+        for key, expected in checks:
+            vec = cond.get(key, {})
+            actual = len(vec)
+            status = "✓ PASS" if actual == expected else "✗ FAIL"
+            print(f"{status}: {key} length = {actual}")
+            if actual != expected:
+                ok = False
+
+    if ok:
+        print("\n✓ Self-test PASSED")
+    else:
+        print("\n✗ Self-test FAILED")
+    return ok
+
+
 # ---- Example usage ----
 if __name__ == "__main__":
-    # Configure multiprocessing to use spawn (safer for TensorFlow/Essentia)
-    multiprocessing.set_start_method('spawn', force=True)
+    # Configure multiprocessing to use fork (faster, inherits CoW memory)
+    multiprocessing.set_start_method('fork', force=True)
+    
+    # CLI argument parsing
+    parser = argparse.ArgumentParser(description="Audio feature extraction for MusicGen conditioning")
+    parser.add_argument("--self-test", action="store_true", help="Run on ≤3 files, print JSON, validate schema")
+    parser.add_argument("--max-files", type=int, default=MAX_FILES_TO_PROCESS, help="Max files to process")
+    cli_args = parser.parse_args()
     
     # Print system info
     print_system_info()
@@ -1699,8 +1960,10 @@ if __name__ == "__main__":
     # Get audio files from the downloads directory
     import glob
     downloads_dir = "/root/workspace/data/jamendo/downloads"
+    base_dir = downloads_dir  # base for relative paths
     all_mp3_files = sorted(glob.glob(f"{downloads_dir}/*.mp3"))
-    test_files = all_mp3_files[:MAX_FILES_TO_PROCESS] if MAX_FILES_TO_PROCESS else all_mp3_files
+    max_files = cli_args.max_files
+    test_files = all_mp3_files[:max_files] if max_files else all_mp3_files
     
     if not test_files:
         print(f"ERROR: No MP3 files found in {downloads_dir}")
@@ -1753,6 +2016,21 @@ if __name__ == "__main__":
     print("\nLoading track metadata...")
     track_metadata_dict = load_track_metadata()
     
+    # Pre-populate label cache so forked workers inherit it (CoW)
+    _populate_label_cache([
+        genre_labels, mood_labels, instrument_labels,
+        genre_discogs519_labels,
+    ])
+
+    # Auto-tune worker count: use configured MAX_WORKERS capped at CPU count
+    effective_workers = min(MAX_WORKERS, os.cpu_count() or 8)
+    print(f"  Worker count: {effective_workers} (CPUs available: {os.cpu_count()})")
+
+    # Handle --self-test mode
+    if cli_args.self_test:
+        ok = _run_self_test(models_dir, downloads_dir)
+        sys.exit(0 if ok else 1)
+
     # Prepare model paths dict for worker processes
     model_paths_dict = {
         'embedding_model': embedding_model,
@@ -1783,16 +2061,16 @@ if __name__ == "__main__":
     
     if True:  # Simplified context (removed GPU monitor)
         if use_parallel:
-            print(f"  Using parallel processing with {MAX_WORKERS} separate processes...")
-            print(f"  (Each process loaded into its own RAM space)\n")
+            print(f"  Using parallel processing with {effective_workers} workers (fork)...")
+            print(f"  (Workers inherit parent memory via copy-on-write)\n")
             
             try:
-                # Try parallel processing with separate processes
-                with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # Try parallel processing with forked processes
+                with ProcessPoolExecutor(max_workers=effective_workers) as executor:
                     # Submit all tasks using the module-level worker function
-                    # Pass (file, model_paths, metadata) as tuple to each worker
+                    # Pass (file, model_paths, metadata, base_dir) as tuple to each worker
                     future_to_file = {
-                        executor.submit(_process_file_worker, (f, model_paths_dict, track_metadata_dict)): f 
+                        executor.submit(_process_file_worker, (f, model_paths_dict, track_metadata_dict, base_dir)): f 
                         for f in test_files
                     }
                     
@@ -1825,14 +2103,14 @@ if __name__ == "__main__":
         
         # Sequential fallback or if parallel was disabled or OOM detected
         if not use_parallel or oom_detected or len(all_results) < len(test_files):
-            remaining_files = [f for f in test_files if not any(r.get("filename") == Path(f).name for r in all_results)]
+            remaining_files = [f for f in test_files if not any(r.get("path") == str(Path(f).relative_to(base_dir)) for r in all_results)]
             
             if remaining_files:
                 print(f"\n  Processing {len(remaining_files)} remaining files sequentially...")
                 
             for test_file in tqdm(remaining_files, desc="Processing audio files", unit="file", 
                                   dynamic_ncols=True, file=sys.stdout):
-                result = _process_file_worker((test_file, model_paths_dict, track_metadata_dict))
+                result = _process_file_worker((test_file, model_paths_dict, track_metadata_dict, base_dir))
                 if result is not None:
                     all_results.append(result)
     
